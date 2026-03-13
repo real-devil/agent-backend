@@ -1,28 +1,17 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
-from openai import AsyncOpenAI
-import os
+from services.rag import rag_chat
 
 router = APIRouter()
-
-
-def get_client():
-    return AsyncOpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        base_url=os.getenv("OPENAI_BASE_URL"),
-    )
 
 
 class ChatRequest(BaseModel):
     message: str
     session_id: str | None = None
+    document_id: str | None = None
 
 
 @router.post("/")
 async def chat(request: ChatRequest):
-    response = await get_client().chat.completions.create(
-        model="openai/gpt-4o-mini",
-        messages=[{"role": "user", "content": request.message}],
-    )
-    reply = response.choices[0].message.content
+    reply = await rag_chat(request.message, document_id=request.document_id)
     return {"reply": reply, "session_id": request.session_id}

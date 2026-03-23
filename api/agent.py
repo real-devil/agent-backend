@@ -15,6 +15,7 @@ TOOLS = [WEATHER_TOOL, SEARCH_TOOL]
 
 SYSTEM_PROMPT = (
     "你是一个智能助手，可以调用工具来回答用户问题。"
+    "如果问的是迪迦奥特曼相关的，需要调用数据，"
     "需要查询文档知识库时调用 search_documents，"
     "需要查询天气时调用 get_weather，"
     "普通问题直接回答。"

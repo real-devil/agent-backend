@@ -1,7 +1,11 @@
 import os
+
 from openai import AsyncOpenAI
-from services.retriever import retrieve_chunks
+
 from prompts.templates import SYSTEM_PROMPT, build_context_message
+from services.retriever import retrieve_chunks
+
+DEFAULT_MODEL = "openai/gpt-4o-mini"
 
 
 def _get_client() -> AsyncOpenAI:
@@ -9,6 +13,10 @@ def _get_client() -> AsyncOpenAI:
         api_key=os.getenv("OPENAI_API_KEY"),
         base_url=os.getenv("OPENAI_BASE_URL"),
     )
+
+
+def _get_model_name() -> str:
+    return os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
 
 
 async def rag_chat(
@@ -24,7 +32,7 @@ async def rag_chat(
     messages.append({"role": "user", "content": question})
 
     response = await _get_client().chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "openai/gpt-4o-mini"),
+        model=_get_model_name(),
         messages=messages,
     )
     return response.choices[0].message.content

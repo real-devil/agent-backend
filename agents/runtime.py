@@ -18,9 +18,11 @@ from tools.weather import WEATHER_TOOL, get_weather
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MODEL = "openai/gpt-4o-mini"
 TOOLS = [WEATHER_TOOL, SEARCH_TOOL]
 MAX_TOOL_ITERATIONS = 5
 MAX_STEP_RETRIES = 1
+WORKFLOW_TIMEOUT_MS = 300_000
 APPROVAL_APPROVED = {"approved", "approve", "yes", "continue"}
 APPROVAL_REJECTED = {"rejected", "reject", "no", "deny", "denied", "stop"}
 
@@ -128,6 +130,10 @@ def _get_client() -> AsyncOpenAI:
         api_key=os.getenv("OPENAI_API_KEY"),
         base_url=os.getenv("OPENAI_BASE_URL"),
     )
+
+
+def _get_model_name() -> str:
+    return os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
 
 
 def _graph_config(session_id: str) -> dict[str, dict[str, str]]:
@@ -556,7 +562,7 @@ def _has_remaining_groups(state: AgentState) -> bool:
 async def _call_text_model(system_prompt: str, user_prompt: str) -> tuple[str, dict[str, Any]]:
     started = time.perf_counter()
     response = await _get_client().chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "openai/gpt-4o-mini"),
+        model=_get_model_name(),
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -781,7 +787,7 @@ async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, A
     for _ in range(MAX_TOOL_ITERATIONS):
         started = time.perf_counter()
         response = await _get_client().chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "openai/gpt-4o-mini"),
+            model=_get_model_name(),
             messages=local_messages,
             tools=TOOLS,
             tool_choice="auto",

@@ -15,9 +15,15 @@ from api import agent, chat, document
 load_dotenv()
 app = FastAPI()
 
+
+def _get_cors_origins() -> list[str]:
+    raw_origins = os.getenv("BACKEND_CORS_ORIGINS", "http://localhost:3000")
+    origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+    return origins or ["http://localhost:3000"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=_get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -1130,7 +1130,10 @@ async def _synthesizer(state: AgentState) -> AgentState:
 
 
 def _route_from_entry(state: AgentState) -> str:
-    if state.get("workflow_status") == "resume" and state.get("workflow_plan"):
+    if (
+        state.get("workflow_status") in {"resume", "awaiting_approval", "rejected"}
+        and state.get("workflow_plan")
+    ) or (state.get("pending_approval_group") and state.get("workflow_plan")):
         return "approval_gate"
     return "planner"
 
@@ -1251,6 +1254,47 @@ async def _get_agent_graph():
     return _agent_graph
 
 
+def _is_waiting_for_approval(snapshot: dict[str, Any]) -> bool:
+    return (
+        snapshot.get("workflow_status") == "awaiting_approval"
+        and bool(snapshot.get("workflow_plan"))
+    )
+
+
+async def _invoke_with_timeout(
+    graph: Any,
+    input_state: dict[str, Any],
+    config: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    try:
+        return await asyncio.wait_for(
+            graph.ainvoke(input_state, config),
+            timeout=WORKFLOW_TIMEOUT_MS / 1000,
+        )
+    except asyncio.TimeoutError:
+        timeout_message = f"Workflow timed out after {WORKFLOW_TIMEOUT_MS // 1000} seconds."
+        snapshot = await graph.aget_state(config)
+        existing_state = snapshot.values or {}
+        await graph.aupdate_state(
+            config,
+            {
+                "workflow_status": "timed_out",
+                "final_reply": timeout_message,
+                "messages": [{"role": "assistant", "content": timeout_message}],
+                "metrics_summary": existing_state.get("metrics_summary", _default_metrics_summary()),
+                "workflow_trace": _trace_event(
+                    "entry",
+                    "workflow_timed_out",
+                    timeout_ms=WORKFLOW_TIMEOUT_MS,
+                ),
+            },
+        )
+        return {
+            "final_reply": timeout_message,
+            "messages": [{"role": "assistant", "content": timeout_message}],
+        }
+
+
 async def get_workflow_snapshot(session_id: str) -> dict[str, Any]:
     graph = await _get_agent_graph()
     snapshot = await graph.aget_state(_graph_config(session_id))
@@ -1263,8 +1307,20 @@ async def run_agent_graph(
     document_id: str | None = None,
 ) -> str:
     graph = await _get_agent_graph()
-    final_state = await graph.ainvoke(
-        {
+    config = _graph_config(session_id)
+    snapshot = await graph.aget_state(config)
+    existing_state = snapshot.values or {}
+
+    if _is_waiting_for_approval(existing_state):
+        input_state = {
+            "messages": [{"role": "user", "content": user_input}],
+            "session_id": session_id,
+            "document_id": document_id,
+            "workflow_status": "awaiting_approval",
+            "final_reply": "",
+        }
+    else:
+        input_state = {
             "messages": [{"role": "user", "content": user_input}],
             "session_id": session_id,
             "document_id": document_id,
@@ -1288,9 +1344,9 @@ async def run_agent_graph(
             "approval_response": "",
             "pending_approval_group": "",
             "final_reply": "",
-        },
-        _graph_config(session_id),
-    )
+        }
+
+    final_state = await _invoke_with_timeout(graph, input_state, config)
     return final_state.get("final_reply") or final_state["messages"][-1].get("content") or ""
 
 
@@ -1300,7 +1356,8 @@ async def resume_agent_graph(
     user_input: str | None = None,
 ) -> str:
     graph = await _get_agent_graph()
-    final_state = await graph.ainvoke(
+    final_state = await _invoke_with_timeout(
+        graph,
         {
             "messages": [{"role": "user", "content": user_input}] if user_input else [],
             "session_id": session_id,

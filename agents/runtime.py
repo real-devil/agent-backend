@@ -3,6 +3,7 @@ import logging
 import os
 from typing import Any
 
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from openai import AsyncOpenAI
 
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 TOOLS = [WEATHER_TOOL, SEARCH_TOOL]
 MAX_TOOL_ITERATIONS = 5
+_checkpointer = InMemorySaver()
 
 SUPERVISOR_PROMPT = """
 You are the supervisor of a small multi-agent system.
@@ -41,6 +43,10 @@ def _get_client() -> AsyncOpenAI:
         api_key=os.getenv("OPENAI_API_KEY"),
         base_url=os.getenv("OPENAI_BASE_URL"),
     )
+
+
+def _graph_config(session_id: str) -> dict[str, dict[str, str]]:
+    return {"configurable": {"thread_id": session_id}}
 
 
 def _get_latest_user_input(state: AgentState) -> str:
@@ -117,7 +123,7 @@ async def _general_agent(state: AgentState) -> AgentState:
         tool_choice="auto",
     )
     assistant_message = _serialize_assistant_message(response.choices[0].message)
-    next_state: AgentState = {"messages": state["messages"] + [assistant_message]}
+    next_state: AgentState = {"messages": [assistant_message]}
 
     if not assistant_message.get("tool_calls"):
         next_state["final_reply"] = assistant_message.get("content", "")
@@ -169,10 +175,7 @@ async def _run_tools(state: AgentState) -> AgentState:
             }
         )
 
-    return {
-        "messages": state["messages"] + tool_messages,
-        "tool_iterations": state.get("tool_iterations", 0) + 1,
-    }
+    return {"messages": tool_messages, "tool_iterations": state.get("tool_iterations", 0) + 1}
 
 
 def _route_after_supervisor(state: AgentState) -> str:
@@ -213,7 +216,7 @@ def build_agent_graph():
     graph.add_edge("run_tools", "general_agent")
     graph.add_edge("rag_agent", END)
 
-    return graph.compile()
+    return graph.compile(checkpointer=_checkpointer)
 
 
 _agent_graph = build_agent_graph()
@@ -221,20 +224,25 @@ _agent_graph = build_agent_graph()
 
 async def run_agent_graph(
     user_input: str,
-    session_id: str | None = None,
+    session_id: str,
     document_id: str | None = None,
 ) -> str:
+    config = _graph_config(session_id)
+    existing_state = await _agent_graph.aget_state(config)
+
+    incoming_messages: list[dict[str, Any]] = []
+    if not existing_state.values:
+        incoming_messages.append({"role": "system", "content": GENERAL_AGENT_PROMPT})
+    incoming_messages.append({"role": "user", "content": user_input})
+
     initial_state: AgentState = {
-        "messages": [
-            {"role": "system", "content": GENERAL_AGENT_PROMPT},
-            {"role": "user", "content": user_input},
-        ],
+        "messages": incoming_messages,
         "session_id": session_id,
         "document_id": document_id,
         "tool_iterations": 0,
     }
 
-    final_state = await _agent_graph.ainvoke(initial_state)
+    final_state = await _agent_graph.ainvoke(initial_state, config)
     if final_state.get("final_reply"):
         return final_state["final_reply"]
 

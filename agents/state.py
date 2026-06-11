@@ -1,8 +1,9 @@
-from typing import Any, TypedDict
+from operator import add
+from typing import Annotated, Any, TypedDict
 
 
 class AgentState(TypedDict, total=False):
-    messages: list[dict[str, Any]]
+    messages: Annotated[list[dict[str, Any]], add]
     session_id: str | None
     document_id: str | None
     route: str

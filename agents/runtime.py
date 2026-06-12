@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from collections.abc import AsyncIterator
 from typing import Any
 
 from langgraph.checkpoint.memory import InMemorySaver
@@ -16,7 +17,6 @@ logger = logging.getLogger(__name__)
 
 TOOLS = [WEATHER_TOOL, SEARCH_TOOL]
 MAX_TOOL_ITERATIONS = 5
-_checkpointer = InMemorySaver()
 
 SUPERVISOR_PROMPT = """
 You are the supervisor of a small multi-agent system.
@@ -37,6 +37,10 @@ GENERAL_AGENT_PROMPT = (
     "Answer directly when no tool is needed."
 )
 
+_agent_graph: Any | None = None
+_checkpointer_cm: AsyncIterator[Any] | None = None
+_checkpointer_kind = "memory"
+
 
 def _get_client() -> AsyncOpenAI:
     return AsyncOpenAI(
@@ -47,6 +51,51 @@ def _get_client() -> AsyncOpenAI:
 
 def _graph_config(session_id: str) -> dict[str, dict[str, str]]:
     return {"configurable": {"thread_id": session_id}}
+
+
+def _get_checkpointer_mode() -> str:
+    return os.getenv("LANGGRAPH_CHECKPOINTER", "memory").strip().lower()
+
+
+def _get_postgres_url() -> str | None:
+    return (
+        os.getenv("LANGGRAPH_POSTGRES_URL")
+        or os.getenv("DATABASE_URL")
+        or os.getenv("POSTGRES_URL")
+    )
+
+
+def get_checkpointer_kind() -> str:
+    return _checkpointer_kind
+
+
+async def _build_checkpointer() -> tuple[Any, AsyncIterator[Any] | None, str]:
+    mode = _get_checkpointer_mode()
+    if mode == "memory":
+        return InMemorySaver(), None, "memory"
+
+    if mode != "postgres":
+        raise ValueError(f"Unsupported LANGGRAPH_CHECKPOINTER mode: {mode}")
+
+    postgres_url = _get_postgres_url()
+    if not postgres_url:
+        raise ValueError(
+            "LANGGRAPH_CHECKPOINTER is set to postgres but no LANGGRAPH_POSTGRES_URL, "
+            "DATABASE_URL, or POSTGRES_URL was provided."
+        )
+
+    try:
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    except ImportError as exc:
+        raise RuntimeError(
+            "Postgres checkpointer dependencies are unavailable. "
+            "Install langgraph-checkpoint-postgres and psycopg-binary."
+        ) from exc
+
+    checkpointer_cm = AsyncPostgresSaver.from_conn_string(postgres_url)
+    checkpointer = await checkpointer_cm.__aenter__()
+    await checkpointer.setup()
+    return checkpointer, checkpointer_cm, "postgres"
 
 
 def _get_latest_user_input(state: AgentState) -> str:
@@ -189,7 +238,7 @@ def _route_after_general_agent(state: AgentState) -> str:
     return END
 
 
-def build_agent_graph():
+def build_agent_graph(checkpointer: Any):
     graph = StateGraph(AgentState)
     graph.add_node("supervisor", _supervisor)
     graph.add_node("general_agent", _general_agent)
@@ -216,10 +265,34 @@ def build_agent_graph():
     graph.add_edge("run_tools", "general_agent")
     graph.add_edge("rag_agent", END)
 
-    return graph.compile(checkpointer=_checkpointer)
+    return graph.compile(checkpointer=checkpointer)
 
 
-_agent_graph = build_agent_graph()
+async def initialize_agent_runtime() -> None:
+    global _agent_graph, _checkpointer_cm, _checkpointer_kind
+    if _agent_graph is not None:
+        return
+
+    checkpointer, checkpointer_cm, checkpointer_kind = await _build_checkpointer()
+    _agent_graph = build_agent_graph(checkpointer)
+    _checkpointer_cm = checkpointer_cm
+    _checkpointer_kind = checkpointer_kind
+    logger.info("Initialized agent runtime with %s checkpointer", checkpointer_kind)
+
+
+async def shutdown_agent_runtime() -> None:
+    global _agent_graph, _checkpointer_cm, _checkpointer_kind
+    if _checkpointer_cm is not None:
+        await _checkpointer_cm.__aexit__(None, None, None)
+    _agent_graph = None
+    _checkpointer_cm = None
+    _checkpointer_kind = "memory"
+
+
+async def _get_agent_graph():
+    if _agent_graph is None:
+        await initialize_agent_runtime()
+    return _agent_graph
 
 
 async def run_agent_graph(
@@ -227,8 +300,9 @@ async def run_agent_graph(
     session_id: str,
     document_id: str | None = None,
 ) -> str:
+    graph = await _get_agent_graph()
     config = _graph_config(session_id)
-    existing_state = await _agent_graph.aget_state(config)
+    existing_state = await graph.aget_state(config)
 
     incoming_messages: list[dict[str, Any]] = []
     if not existing_state.values:
@@ -242,7 +316,7 @@ async def run_agent_graph(
         "tool_iterations": 0,
     }
 
-    final_state = await _agent_graph.ainvoke(initial_state, config)
+    final_state = await graph.ainvoke(initial_state, config)
     if final_state.get("final_reply"):
         return final_state["final_reply"]
 

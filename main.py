@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from agents.runtime import (
     get_checkpointer_kind,
+    get_runtime_health,
     initialize_agent_runtime,
     shutdown_agent_runtime,
 )
@@ -53,3 +54,10 @@ def check_db():
     db = get_client()
     result = db.table("document_chunks").select("id").limit(1).execute()
     return {"status": "connected", "data": result.data}
+
+
+@app.get("/health/agent")
+def check_agent():
+    health = get_runtime_health()
+    health["status"] = "ok" if health["initialized"] and not health["config_errors"] else "degraded"
+    return health

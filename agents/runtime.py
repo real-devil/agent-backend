@@ -40,6 +40,7 @@ GENERAL_AGENT_PROMPT = (
 _agent_graph: Any | None = None
 _checkpointer_cm: AsyncIterator[Any] | None = None
 _checkpointer_kind = "memory"
+_runtime_last_error: str | None = None
 
 
 def _get_client() -> AsyncOpenAI:
@@ -67,6 +68,36 @@ def _get_postgres_url() -> str | None:
 
 def get_checkpointer_kind() -> str:
     return _checkpointer_kind
+
+
+def validate_runtime_config() -> list[str]:
+    errors: list[str] = []
+
+    if not os.getenv("OPENAI_API_KEY"):
+        errors.append("Missing OPENAI_API_KEY")
+
+    mode = _get_checkpointer_mode()
+    if mode not in {"memory", "postgres"}:
+        errors.append("LANGGRAPH_CHECKPOINTER must be either 'memory' or 'postgres'")
+
+    if mode == "postgres" and not _get_postgres_url():
+        errors.append(
+            "LANGGRAPH_CHECKPOINTER is 'postgres' but LANGGRAPH_POSTGRES_URL, DATABASE_URL, "
+            "or POSTGRES_URL is not configured"
+        )
+
+    return errors
+
+
+def get_runtime_health() -> dict[str, Any]:
+    return {
+        "initialized": _agent_graph is not None,
+        "checkpointer": _checkpointer_kind,
+        "configured_mode": _get_checkpointer_mode(),
+        "has_postgres_url": bool(_get_postgres_url()),
+        "config_errors": validate_runtime_config(),
+        "last_error": _runtime_last_error,
+    }
 
 
 async def _build_checkpointer() -> tuple[Any, AsyncIterator[Any] | None, str]:
@@ -269,24 +300,31 @@ def build_agent_graph(checkpointer: Any):
 
 
 async def initialize_agent_runtime() -> None:
-    global _agent_graph, _checkpointer_cm, _checkpointer_kind
+    global _agent_graph, _checkpointer_cm, _checkpointer_kind, _runtime_last_error
     if _agent_graph is not None:
         return
+
+    config_errors = validate_runtime_config()
+    if config_errors:
+        _runtime_last_error = "; ".join(config_errors)
+        raise RuntimeError(_runtime_last_error)
 
     checkpointer, checkpointer_cm, checkpointer_kind = await _build_checkpointer()
     _agent_graph = build_agent_graph(checkpointer)
     _checkpointer_cm = checkpointer_cm
     _checkpointer_kind = checkpointer_kind
+    _runtime_last_error = None
     logger.info("Initialized agent runtime with %s checkpointer", checkpointer_kind)
 
 
 async def shutdown_agent_runtime() -> None:
-    global _agent_graph, _checkpointer_cm, _checkpointer_kind
+    global _agent_graph, _checkpointer_cm, _checkpointer_kind, _runtime_last_error
     if _checkpointer_cm is not None:
         await _checkpointer_cm.__aexit__(None, None, None)
     _agent_graph = None
     _checkpointer_cm = None
     _checkpointer_kind = "memory"
+    _runtime_last_error = None
 
 
 async def _get_agent_graph():

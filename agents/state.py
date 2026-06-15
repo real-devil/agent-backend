@@ -10,6 +10,7 @@ class AgentState(TypedDict, total=False):
     route_reason: str
     final_reply: str
     artifacts: dict[str, Any]
+    metrics_summary: dict[str, Any]
     workflow_status: str
     workflow_plan: list[dict[str, Any]]
     success_criteria: list[str]

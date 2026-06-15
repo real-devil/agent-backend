@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -9,7 +10,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from openai import AsyncOpenAI
 
-from agents.schemas import ArtifactRecord, ReviewPayload, StepSpec, StructuredStepOutput, TraceEvent
+from agents.schemas import ArtifactRecord, MetricsSummary, ReviewPayload, StepSpec, StructuredStepOutput, TraceEvent
 from agents.state import AgentState
 from services.rag import rag_chat
 from tools.search import SEARCH_TOOL, search_documents
@@ -272,6 +273,58 @@ def _trace_event(node: str, event_type: str, **detail: Any) -> list[dict[str, An
     return [TraceEvent(event_type=event_type, node=node, detail=detail).model_dump()]
 
 
+def _default_metrics_summary() -> dict[str, Any]:
+    return MetricsSummary().model_dump()
+
+
+def _usage_to_dict(usage: Any) -> dict[str, int]:
+    if usage is None:
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+    completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+    total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _merge_metrics(
+    current: dict[str, Any] | None,
+    *,
+    duration_ms: int = 0,
+    usage: dict[str, int] | None = None,
+    model_calls: int = 0,
+    tool_calls: int = 0,
+    approval_requested: int = 0,
+    approval_granted: int = 0,
+    approval_rejected: int = 0,
+    rollback_count: int = 0,
+    failure_category: str | None = None,
+) -> dict[str, Any]:
+    merged = dict(current or _default_metrics_summary())
+    merged["total_duration_ms"] = int(merged.get("total_duration_ms", 0)) + int(duration_ms)
+    merged["total_model_calls"] = int(merged.get("total_model_calls", 0)) + int(model_calls)
+    merged["total_tool_calls"] = int(merged.get("total_tool_calls", 0)) + int(tool_calls)
+    merged["approval_requests"] = int(merged.get("approval_requests", 0)) + int(approval_requested)
+    merged["approval_grants"] = int(merged.get("approval_grants", 0)) + int(approval_granted)
+    merged["approval_rejections"] = int(merged.get("approval_rejections", 0)) + int(approval_rejected)
+    merged["rollback_count"] = int(merged.get("rollback_count", 0)) + int(rollback_count)
+
+    normalized_usage = usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    merged["prompt_tokens"] = int(merged.get("prompt_tokens", 0)) + int(normalized_usage.get("prompt_tokens", 0))
+    merged["completion_tokens"] = int(merged.get("completion_tokens", 0)) + int(normalized_usage.get("completion_tokens", 0))
+    merged["total_tokens"] = int(merged.get("total_tokens", 0)) + int(normalized_usage.get("total_tokens", 0))
+
+    failure_counts = dict(merged.get("failure_counts", {}))
+    if failure_category and failure_category != "none":
+        failure_counts[failure_category] = int(failure_counts.get(failure_category, 0)) + 1
+    merged["failure_counts"] = failure_counts
+    return merged
+
+
 def _parse_structured_step_output(raw_content: str, output_key: str) -> dict[str, Any]:
     payload = _parse_json_object(raw_content)
     if not payload:
@@ -500,7 +553,8 @@ def _has_remaining_groups(state: AgentState) -> bool:
     return state.get("current_group_index", 0) + 1 < len(_ordered_group_ids(state))
 
 
-async def _call_text_model(system_prompt: str, user_prompt: str) -> str:
+async def _call_text_model(system_prompt: str, user_prompt: str) -> tuple[str, dict[str, Any]]:
+    started = time.perf_counter()
     response = await _get_client().chat.completions.create(
         model=os.getenv("OPENAI_MODEL", "openai/gpt-4o-mini"),
         messages=[
@@ -508,15 +562,20 @@ async def _call_text_model(system_prompt: str, user_prompt: str) -> str:
             {"role": "user", "content": user_prompt},
         ],
     )
-    return response.choices[0].message.content or ""
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    usage = _usage_to_dict(getattr(response, "usage", None))
+    return response.choices[0].message.content or "", {
+        "duration_ms": duration_ms,
+        "usage": usage,
+    }
 
 
-async def _call_structured_step_model(system_prompt: str, user_prompt: str) -> dict[str, Any]:
-    raw_content = await _call_text_model(
+async def _call_structured_step_model(system_prompt: str, user_prompt: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    raw_content, meta = await _call_text_model(
         f"{system_prompt}\n\n{STRUCTURED_STEP_OUTPUT_PROMPT}",
         user_prompt,
     )
-    return _parse_json_object(raw_content)
+    return _parse_json_object(raw_content), meta
 
 
 async def _entry(state: AgentState) -> AgentState:
@@ -529,11 +588,24 @@ async def _planner(state: AgentState) -> AgentState:
         f"Conversation context:\n{_recent_conversation_text(state)}\n\n"
         f"document_id present: {'yes' if state.get('document_id') else 'no'}"
     )
-    raw_content = await _call_text_model(PLANNER_PROMPT, user_prompt)
+    raw_content, meta = await _call_text_model(PLANNER_PROMPT, user_prompt)
     plan = _normalize_plan(_parse_json_object(raw_content), state)
     return {
         "artifacts": {},
-        "workflow_trace": _trace_event("planner", "plan_created", step_count=len(plan["steps"]), workflow_status=plan["workflow_status"]),
+        "metrics_summary": _merge_metrics(
+            state.get("metrics_summary"),
+            duration_ms=meta["duration_ms"],
+            usage=meta["usage"],
+            model_calls=1,
+        ),
+        "workflow_trace": _trace_event(
+            "planner",
+            "plan_created",
+            step_count=len(plan["steps"]),
+            workflow_status=plan["workflow_status"],
+            duration_ms=meta["duration_ms"],
+            usage=meta["usage"],
+        ),
         "workflow_status": plan["workflow_status"],
         "workflow_plan": plan["steps"],
         "route_reason": plan["route_reason"],
@@ -561,6 +633,7 @@ async def _approval_gate(state: AgentState) -> AgentState:
     requires_approval = any(bool(step.get("approval_required")) for step in current_steps)
     if not requires_approval:
         return {
+            "metrics_summary": state.get("metrics_summary", _default_metrics_summary()),
             "workflow_trace": _trace_event("approval_gate", "approval_skipped", group_id=_get_current_group_id(state)),
             "workflow_status": "in_progress",
             "pending_approval_group": "",
@@ -573,6 +646,10 @@ async def _approval_gate(state: AgentState) -> AgentState:
     if approval_response in APPROVAL_REJECTED:
         message = f"Workflow stopped because approval was rejected for group {current_group}."
         return {
+            "metrics_summary": _merge_metrics(
+                state.get("metrics_summary"),
+                approval_rejected=1,
+            ),
             "workflow_trace": _trace_event("approval_gate", "approval_rejected", group_id=current_group),
             "workflow_status": "rejected",
             "pending_approval_group": current_group,
@@ -587,6 +664,10 @@ async def _approval_gate(state: AgentState) -> AgentState:
             f"Pending goals: {goals}"
         )
         return {
+            "metrics_summary": _merge_metrics(
+                state.get("metrics_summary"),
+                approval_requested=1,
+            ),
             "workflow_trace": _trace_event("approval_gate", "approval_requested", group_id=current_group, goals=goals),
             "workflow_status": "awaiting_approval",
             "pending_approval_group": current_group,
@@ -595,6 +676,10 @@ async def _approval_gate(state: AgentState) -> AgentState:
         }
 
     return {
+        "metrics_summary": _merge_metrics(
+            state.get("metrics_summary"),
+            approval_granted=1,
+        ),
         "workflow_trace": _trace_event("approval_gate", "approval_granted", group_id=current_group),
         "workflow_status": "in_progress",
         "pending_approval_group": "",
@@ -607,7 +692,10 @@ async def _approval_gate(state: AgentState) -> AgentState:
 
 async def _run_research_step(step: dict[str, Any], state: AgentState) -> dict[str, Any]:
     if state.get("document_id"):
+        started = time.perf_counter()
         result = await search_documents(query=step["goal"], document_id=state["document_id"])
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         parsed = {
             "summary": f"Retrieved document evidence for {step['output_key']}",
             "artifact_type": "facts",
@@ -615,22 +703,22 @@ async def _run_research_step(step: dict[str, Any], state: AgentState) -> dict[st
             "confidence": "medium",
         }
     else:
-        parsed = _parse_structured_step_output(
-            json.dumps(
-                await _call_structured_step_model(
-                    RESEARCH_AGENT_PROMPT,
-                    (
-                        f"Current step goal:\n{step['goal']}\n\n"
-                        f"Latest user request:\n{_get_latest_user_input(state)}\n\n"
-                        f"Accepted step results so far:\n{json.dumps(state.get('step_results', []), ensure_ascii=False)}\n\n"
-                        f"Existing artifacts:\n{_artifact_context_text(state)}"
-                    ),
-                ),
-                ensure_ascii=False,
+        structured_payload, meta = await _call_structured_step_model(
+            RESEARCH_AGENT_PROMPT,
+            (
+                f"Current step goal:\n{step['goal']}\n\n"
+                f"Latest user request:\n{_get_latest_user_input(state)}\n\n"
+                f"Accepted step results so far:\n{json.dumps(state.get('step_results', []), ensure_ascii=False)}\n\n"
+                f"Existing artifacts:\n{_artifact_context_text(state)}"
             ),
+        )
+        parsed = _parse_structured_step_output(
+            json.dumps(structured_payload, ensure_ascii=False),
             step["output_key"],
         )
         result = str(parsed["summary"])
+        duration_ms = meta["duration_ms"]
+        usage = meta["usage"]
     artifact = _build_artifact_record(
         step=step,
         agent="research_agent",
@@ -646,6 +734,12 @@ async def _run_research_step(step: dict[str, Any], state: AgentState) -> dict[st
         "goal": step["goal"],
         "result": result,
         "artifact": artifact,
+        "metrics": {
+            "duration_ms": duration_ms,
+            "usage": usage,
+            "model_calls": 0 if state.get("document_id") else 1,
+            "tool_calls": 1 if state.get("document_id") else 0,
+        },
     }
 
 
@@ -680,13 +774,24 @@ async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, A
         "artifact_data": final_result,
         "confidence": "medium",
     }
+    total_duration_ms = 0
+    total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    tool_call_count = 0
+    model_call_count = 0
     for _ in range(MAX_TOOL_ITERATIONS):
+        started = time.perf_counter()
         response = await _get_client().chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "openai/gpt-4o-mini"),
             messages=local_messages,
             tools=TOOLS,
             tool_choice="auto",
         )
+        model_call_count += 1
+        total_duration_ms += int((time.perf_counter() - started) * 1000)
+        usage = _usage_to_dict(getattr(response, "usage", None))
+        total_usage["prompt_tokens"] += usage["prompt_tokens"]
+        total_usage["completion_tokens"] += usage["completion_tokens"]
+        total_usage["total_tokens"] += usage["total_tokens"]
         assistant_message = _serialize_assistant_message(response.choices[0].message)
         if not assistant_message.get("tool_calls"):
             final_result = assistant_message.get("content", "") or final_result
@@ -694,6 +799,7 @@ async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, A
             break
         local_messages.append(assistant_message)
         for tool_call in assistant_message["tool_calls"]:
+            tool_call_count += 1
             fn_name = tool_call["function"]["name"]
             raw_args = tool_call["function"]["arguments"]
             try:
@@ -725,11 +831,19 @@ async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, A
         "goal": step["goal"],
         "result": str(final_parsed["summary"]),
         "artifact": artifact,
+        "metrics": {
+            "duration_ms": total_duration_ms,
+            "usage": total_usage,
+            "model_calls": model_call_count,
+            "tool_calls": tool_call_count,
+        },
     }
 
 
 async def _run_rag_step(step: dict[str, Any], state: AgentState) -> dict[str, Any]:
+    started = time.perf_counter()
     result = await rag_chat(question=step["goal"], document_id=state.get("document_id"))
+    duration_ms = int((time.perf_counter() - started) * 1000)
     artifact = _build_artifact_record(
         step=step,
         agent="rag_agent",
@@ -745,23 +859,27 @@ async def _run_rag_step(step: dict[str, Any], state: AgentState) -> dict[str, An
         "goal": step["goal"],
         "result": result or "",
         "artifact": artifact,
+        "metrics": {
+            "duration_ms": duration_ms,
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "model_calls": 1,
+            "tool_calls": 0,
+        },
     }
 
 
 async def _run_general_step(step: dict[str, Any], state: AgentState) -> dict[str, Any]:
-    parsed = _parse_structured_step_output(
-        json.dumps(
-            await _call_structured_step_model(
-                GENERAL_AGENT_PROMPT,
-                (
-                    f"Current step goal:\n{step['goal']}\n\n"
-                    f"Latest user request:\n{_get_latest_user_input(state)}\n\n"
-                    f"Accepted step results so far:\n{json.dumps(state.get('step_results', []), ensure_ascii=False)}\n\n"
-                    f"Existing artifacts:\n{_artifact_context_text(state)}"
-                ),
-            ),
-            ensure_ascii=False,
+    structured_payload, meta = await _call_structured_step_model(
+        GENERAL_AGENT_PROMPT,
+        (
+            f"Current step goal:\n{step['goal']}\n\n"
+            f"Latest user request:\n{_get_latest_user_input(state)}\n\n"
+            f"Accepted step results so far:\n{json.dumps(state.get('step_results', []), ensure_ascii=False)}\n\n"
+            f"Existing artifacts:\n{_artifact_context_text(state)}"
         ),
+    )
+    parsed = _parse_structured_step_output(
+        json.dumps(structured_payload, ensure_ascii=False),
         step["output_key"],
     )
     artifact = _build_artifact_record(
@@ -779,6 +897,12 @@ async def _run_general_step(step: dict[str, Any], state: AgentState) -> dict[str
         "goal": step["goal"],
         "result": str(parsed["summary"]),
         "artifact": artifact,
+        "metrics": {
+            "duration_ms": meta["duration_ms"],
+            "usage": meta["usage"],
+            "model_calls": 1,
+            "tool_calls": 0,
+        },
     }
 
 
@@ -799,7 +923,23 @@ async def _execute_group(state: AgentState) -> AgentState:
     combined_text = "\n\n".join(
         f"[{result['step_id']} - {result['agent']}]\n{result['result']}" for result in results
     )
+    total_duration_ms = sum(int(result.get("metrics", {}).get("duration_ms", 0)) for result in results)
+    total_model_calls = sum(int(result.get("metrics", {}).get("model_calls", 0)) for result in results)
+    total_tool_calls = sum(int(result.get("metrics", {}).get("tool_calls", 0)) for result in results)
+    total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for result in results:
+        usage = result.get("metrics", {}).get("usage", {})
+        total_usage["prompt_tokens"] += int(usage.get("prompt_tokens", 0))
+        total_usage["completion_tokens"] += int(usage.get("completion_tokens", 0))
+        total_usage["total_tokens"] += int(usage.get("total_tokens", 0))
     return {
+        "metrics_summary": _merge_metrics(
+            state.get("metrics_summary"),
+            duration_ms=total_duration_ms,
+            usage=total_usage,
+            model_calls=total_model_calls,
+            tool_calls=total_tool_calls,
+        ),
         "workflow_status": "in_progress",
         "current_group_results": results,
         "current_step_result": combined_text,
@@ -811,6 +951,10 @@ async def _execute_group(state: AgentState) -> AgentState:
             "group_executed",
             group_id=_get_current_group_id(state),
             step_ids=[result["step_id"] for result in results],
+            duration_ms=total_duration_ms,
+            model_calls=total_model_calls,
+            tool_calls=total_tool_calls,
+            usage=total_usage,
         ),
         "final_reply": "",
     }
@@ -827,7 +971,8 @@ async def _reviewer(state: AgentState) -> AgentState:
         f"Current retry count: {state.get('step_retry_count', 0)}\n"
         f"Has remaining groups after this one: {'yes' if _has_remaining_groups(state) else 'no'}"
     )
-    payload = _parse_json_object(await _call_text_model(REVIEWER_PROMPT, user_prompt))
+    raw_content, meta = await _call_text_model(REVIEWER_PROMPT, user_prompt)
+    payload = _parse_json_object(raw_content)
     try:
         review_payload = ReviewPayload(
             decision=str(payload.get("decision", "continue")).lower(),
@@ -873,6 +1018,13 @@ async def _reviewer(state: AgentState) -> AgentState:
         "review_failure_category": failure_category,
         "review_rollback_target": rollback_to_step_id,
         "artifacts": artifacts,
+        "metrics_summary": _merge_metrics(
+            state.get("metrics_summary"),
+            duration_ms=meta["duration_ms"],
+            usage=meta["usage"],
+            model_calls=1,
+            failure_category=failure_category,
+        ),
         "step_results": step_results,
         "step_retry_count": retry_count + 1 if decision == "retry" else 0,
         "workflow_trace": _trace_event(
@@ -881,6 +1033,8 @@ async def _reviewer(state: AgentState) -> AgentState:
             decision=decision,
             failure_category=failure_category,
             rollback_to_step_id=rollback_to_step_id,
+            duration_ms=meta["duration_ms"],
+            usage=meta["usage"],
         ),
     }
 
@@ -923,6 +1077,10 @@ async def _rollback_group(state: AgentState) -> AgentState:
         "review_failure_category": "",
         "review_rollback_target": "",
         "artifacts": _rebuild_artifacts_from_step_results(retained_step_results),
+        "metrics_summary": _merge_metrics(
+            state.get("metrics_summary"),
+            rollback_count=1,
+        ),
         "step_results": retained_step_results,
         "step_retry_count": 0,
         "approval_response": "",
@@ -945,11 +1103,22 @@ async def _synthesizer(state: AgentState) -> AgentState:
         f"Accepted step results:\n{json.dumps(state.get('step_results', []), ensure_ascii=False)}\n\n"
         f"Artifacts:\n{_artifact_context_text(state)}"
     )
-    final_reply = await _call_text_model(SYNTHESIZER_PROMPT, user_prompt)
+    final_reply, meta = await _call_text_model(SYNTHESIZER_PROMPT, user_prompt)
     return {
         "final_reply": final_reply,
+        "metrics_summary": _merge_metrics(
+            state.get("metrics_summary"),
+            duration_ms=meta["duration_ms"],
+            usage=meta["usage"],
+            model_calls=1,
+        ),
         "workflow_status": "completed",
-        "workflow_trace": _trace_event("synthesizer", "final_answer_created"),
+        "workflow_trace": _trace_event(
+            "synthesizer",
+            "final_answer_created",
+            duration_ms=meta["duration_ms"],
+            usage=meta["usage"],
+        ),
         "messages": [{"role": "assistant", "content": final_reply}],
     }
 

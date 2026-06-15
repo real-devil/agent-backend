@@ -41,3 +41,17 @@ class TraceEvent(BaseModel):
     event_type: str
     node: str
     detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class MetricsSummary(BaseModel):
+    total_duration_ms: int = 0
+    total_model_calls: int = 0
+    total_tool_calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    approval_requests: int = 0
+    approval_grants: int = 0
+    approval_rejections: int = 0
+    rollback_count: int = 0
+    failure_counts: dict[str, int] = Field(default_factory=dict)

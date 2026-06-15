@@ -40,5 +40,6 @@ async def get_agent_session_state(session_id: str) -> dict[str, str | int | list
         "pending_approval_group": snapshot.get("pending_approval_group"),
         "review_decision": snapshot.get("review_decision"),
         "review_reason": snapshot.get("review_reason"),
+        "artifacts": snapshot.get("artifacts"),
         "workflow_plan": snapshot.get("workflow_plan"),
     }

@@ -79,6 +79,16 @@ Use tools when needed and return a concise result for the current step.
 Do not produce the final user-facing answer unless the step explicitly requires it.
 """.strip()
 
+STRUCTURED_STEP_OUTPUT_PROMPT = """
+Return JSON only with this schema:
+{
+  "summary": "short concise summary",
+  "artifact_type": "notes" | "facts" | "answer" | "analysis" | "tool_result",
+  "artifact_data": "string or object containing the useful output",
+  "confidence": "high" | "medium" | "low"
+}
+""".strip()
+
 REVIEWER_PROMPT = """
 You are the reviewer of a multi-agent workflow.
 Inspect the current group results and decide whether to continue, retry, or finish.
@@ -250,6 +260,69 @@ def _serialize_assistant_message(message: Any) -> dict[str, Any]:
     return payload
 
 
+def _artifact_context_text(state: AgentState) -> str:
+    artifacts = state.get("artifacts", {})
+    if not artifacts:
+        return "{}"
+    return json.dumps(artifacts, ensure_ascii=False)
+
+
+def _parse_structured_step_output(raw_content: str, output_key: str) -> dict[str, Any]:
+    payload = _parse_json_object(raw_content)
+    if not payload:
+        return {
+            "summary": raw_content.strip() or output_key,
+            "artifact_type": "analysis",
+            "artifact_data": raw_content.strip(),
+            "confidence": "medium",
+        }
+
+    summary = str(payload.get("summary", "")).strip() or output_key
+    artifact_type = str(payload.get("artifact_type", "analysis")).strip().lower() or "analysis"
+    if artifact_type not in {"notes", "facts", "answer", "analysis", "tool_result"}:
+        artifact_type = "analysis"
+    confidence = str(payload.get("confidence", "medium")).strip().lower() or "medium"
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "medium"
+
+    return {
+        "summary": summary,
+        "artifact_type": artifact_type,
+        "artifact_data": payload.get("artifact_data", summary),
+        "confidence": confidence,
+    }
+
+
+def _build_artifact_record(
+    *,
+    step: dict[str, Any],
+    agent: str,
+    summary: str,
+    artifact_type: str,
+    artifact_data: Any,
+    confidence: str,
+) -> dict[str, Any]:
+    return {
+        "step_id": step["id"],
+        "output_key": step["output_key"],
+        "agent": agent,
+        "artifact_type": artifact_type,
+        "summary": summary,
+        "confidence": confidence,
+        "data": artifact_data,
+    }
+
+
+def _rebuild_artifacts_from_step_results(step_results: list[dict[str, Any]]) -> dict[str, Any]:
+    artifacts: dict[str, Any] = {}
+    for result in step_results:
+        output_key = str(result.get("output_key", "")).strip()
+        artifact = result.get("artifact")
+        if output_key and artifact is not None:
+            artifacts[output_key] = artifact
+    return artifacts
+
+
 def _fallback_plan(state: AgentState) -> dict[str, Any]:
     latest_input = _get_latest_user_input(state).lower()
     if state.get("document_id"):
@@ -393,6 +466,16 @@ def _truncate_step_results_before_group(state: AgentState, target_group_index: i
     return retained
 
 
+def _merge_artifacts(current_artifacts: dict[str, Any], results: list[dict[str, Any]]) -> dict[str, Any]:
+    merged = dict(current_artifacts)
+    for result in results:
+        output_key = str(result.get("output_key", "")).strip()
+        artifact = result.get("artifact")
+        if output_key and artifact is not None:
+            merged[output_key] = artifact
+    return merged
+
+
 def _get_current_group_id(state: AgentState) -> int:
     groups = _ordered_group_ids(state)
     index = min(state.get("current_group_index", 0), len(groups) - 1)
@@ -419,6 +502,14 @@ async def _call_text_model(system_prompt: str, user_prompt: str) -> str:
     return response.choices[0].message.content or ""
 
 
+async def _call_structured_step_model(system_prompt: str, user_prompt: str) -> dict[str, Any]:
+    raw_content = await _call_text_model(
+        f"{system_prompt}\n\n{STRUCTURED_STEP_OUTPUT_PROMPT}",
+        user_prompt,
+    )
+    return _parse_json_object(raw_content)
+
+
 async def _entry(state: AgentState) -> AgentState:
     return {}
 
@@ -432,6 +523,7 @@ async def _planner(state: AgentState) -> AgentState:
     raw_content = await _call_text_model(PLANNER_PROMPT, user_prompt)
     plan = _normalize_plan(_parse_json_object(raw_content), state)
     return {
+        "artifacts": {},
         "workflow_status": plan["workflow_status"],
         "workflow_plan": plan["steps"],
         "route_reason": plan["route_reason"],
@@ -502,20 +594,44 @@ async def _approval_gate(state: AgentState) -> AgentState:
 async def _run_research_step(step: dict[str, Any], state: AgentState) -> dict[str, Any]:
     if state.get("document_id"):
         result = await search_documents(query=step["goal"], document_id=state["document_id"])
+        parsed = {
+            "summary": f"Retrieved document evidence for {step['output_key']}",
+            "artifact_type": "facts",
+            "artifact_data": result,
+            "confidence": "medium",
+        }
     else:
-        result = await _call_text_model(
-            RESEARCH_AGENT_PROMPT,
-            (
-                f"Current step goal:\n{step['goal']}\n\n"
-                f"Latest user request:\n{_get_latest_user_input(state)}\n\n"
-                f"Accepted step results so far:\n{json.dumps(state.get('step_results', []), ensure_ascii=False)}"
+        parsed = _parse_structured_step_output(
+            json.dumps(
+                await _call_structured_step_model(
+                    RESEARCH_AGENT_PROMPT,
+                    (
+                        f"Current step goal:\n{step['goal']}\n\n"
+                        f"Latest user request:\n{_get_latest_user_input(state)}\n\n"
+                        f"Accepted step results so far:\n{json.dumps(state.get('step_results', []), ensure_ascii=False)}\n\n"
+                        f"Existing artifacts:\n{_artifact_context_text(state)}"
+                    ),
+                ),
+                ensure_ascii=False,
             ),
+            step["output_key"],
         )
+        result = str(parsed["summary"])
+    artifact = _build_artifact_record(
+        step=step,
+        agent="research_agent",
+        summary=str(parsed["summary"]),
+        artifact_type=str(parsed["artifact_type"]),
+        artifact_data=parsed["artifact_data"],
+        confidence=str(parsed["confidence"]),
+    )
     return {
         "step_id": step["id"],
+        "output_key": step["output_key"],
         "agent": "research_agent",
         "goal": step["goal"],
         "result": result,
+        "artifact": artifact,
     }
 
 
@@ -531,18 +647,25 @@ async def _tool_execute(name: str, args: dict[str, Any], state: AgentState) -> s
 
 async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, Any]:
     local_messages: list[dict[str, Any]] = [
-        {"role": "system", "content": TOOL_AGENT_PROMPT},
+        {"role": "system", "content": f"{TOOL_AGENT_PROMPT}\n\n{STRUCTURED_STEP_OUTPUT_PROMPT}"},
         {
             "role": "user",
             "content": (
                 f"Current step goal:\n{step['goal']}\n\n"
                 f"Latest user request:\n{_get_latest_user_input(state)}\n\n"
-                f"Accepted step results so far:\n{json.dumps(state.get('step_results', []), ensure_ascii=False)}"
+                f"Accepted step results so far:\n{json.dumps(state.get('step_results', []), ensure_ascii=False)}\n\n"
+                f"Existing artifacts:\n{_artifact_context_text(state)}"
             ),
         },
     ]
 
     final_result = "Tool agent ended without producing a final result."
+    final_parsed = {
+        "summary": final_result,
+        "artifact_type": "tool_result",
+        "artifact_data": final_result,
+        "confidence": "medium",
+    }
     for _ in range(MAX_TOOL_ITERATIONS):
         response = await _get_client().chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "openai/gpt-4o-mini"),
@@ -553,6 +676,7 @@ async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, A
         assistant_message = _serialize_assistant_message(response.choices[0].message)
         if not assistant_message.get("tool_calls"):
             final_result = assistant_message.get("content", "") or final_result
+            final_parsed = _parse_structured_step_output(final_result, step["output_key"])
             break
         local_messages.append(assistant_message)
         for tool_call in assistant_message["tool_calls"]:
@@ -572,38 +696,75 @@ async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, A
                     "content": tool_result,
                 }
             )
+    artifact = _build_artifact_record(
+        step=step,
+        agent="tool_agent",
+        summary=str(final_parsed["summary"]),
+        artifact_type=str(final_parsed["artifact_type"]),
+        artifact_data=final_parsed["artifact_data"],
+        confidence=str(final_parsed["confidence"]),
+    )
     return {
         "step_id": step["id"],
+        "output_key": step["output_key"],
         "agent": "tool_agent",
         "goal": step["goal"],
-        "result": final_result,
+        "result": str(final_parsed["summary"]),
+        "artifact": artifact,
     }
 
 
 async def _run_rag_step(step: dict[str, Any], state: AgentState) -> dict[str, Any]:
     result = await rag_chat(question=step["goal"], document_id=state.get("document_id"))
+    artifact = _build_artifact_record(
+        step=step,
+        agent="rag_agent",
+        summary=f"Answered document question for {step['output_key']}",
+        artifact_type="answer",
+        artifact_data=result or "",
+        confidence="medium",
+    )
     return {
         "step_id": step["id"],
+        "output_key": step["output_key"],
         "agent": "rag_agent",
         "goal": step["goal"],
         "result": result or "",
+        "artifact": artifact,
     }
 
 
 async def _run_general_step(step: dict[str, Any], state: AgentState) -> dict[str, Any]:
-    result = await _call_text_model(
-        GENERAL_AGENT_PROMPT,
-        (
-            f"Current step goal:\n{step['goal']}\n\n"
-            f"Latest user request:\n{_get_latest_user_input(state)}\n\n"
-            f"Accepted step results so far:\n{json.dumps(state.get('step_results', []), ensure_ascii=False)}"
+    parsed = _parse_structured_step_output(
+        json.dumps(
+            await _call_structured_step_model(
+                GENERAL_AGENT_PROMPT,
+                (
+                    f"Current step goal:\n{step['goal']}\n\n"
+                    f"Latest user request:\n{_get_latest_user_input(state)}\n\n"
+                    f"Accepted step results so far:\n{json.dumps(state.get('step_results', []), ensure_ascii=False)}\n\n"
+                    f"Existing artifacts:\n{_artifact_context_text(state)}"
+                ),
+            ),
+            ensure_ascii=False,
         ),
+        step["output_key"],
+    )
+    artifact = _build_artifact_record(
+        step=step,
+        agent="general_agent",
+        summary=str(parsed["summary"]),
+        artifact_type=str(parsed["artifact_type"]),
+        artifact_data=parsed["artifact_data"],
+        confidence=str(parsed["confidence"]),
     )
     return {
         "step_id": step["id"],
+        "output_key": step["output_key"],
         "agent": "general_agent",
         "goal": step["goal"],
-        "result": result,
+        "result": str(parsed["summary"]),
+        "artifact": artifact,
     }
 
 
@@ -642,6 +803,7 @@ async def _reviewer(state: AgentState) -> AgentState:
         f"Current group index: {state.get('current_group_index', 0)}\n\n"
         f"Current group results:\n{json.dumps(state.get('current_group_results', []), ensure_ascii=False)}\n\n"
         f"Accepted step results so far:\n{json.dumps(state.get('step_results', []), ensure_ascii=False)}\n\n"
+        f"Current artifacts:\n{_artifact_context_text(state)}\n\n"
         f"Current retry count: {state.get('step_retry_count', 0)}\n"
         f"Has remaining groups after this one: {'yes' if _has_remaining_groups(state) else 'no'}"
     )
@@ -669,14 +831,17 @@ async def _reviewer(state: AgentState) -> AgentState:
         decision = "finish"
 
     step_results = state.get("step_results", [])
+    artifacts = state.get("artifacts", {})
     if decision in {"continue", "finish"}:
         step_results = step_results + state.get("current_group_results", [])
+        artifacts = _merge_artifacts(artifacts, state.get("current_group_results", []))
 
     return {
         "review_decision": decision,
         "review_reason": reason,
         "review_failure_category": failure_category,
         "review_rollback_target": rollback_to_step_id,
+        "artifacts": artifacts,
         "step_results": step_results,
         "step_retry_count": retry_count + 1 if decision == "retry" else 0,
     }
@@ -703,6 +868,7 @@ async def _advance_group(state: AgentState) -> AgentState:
 async def _rollback_group(state: AgentState) -> AgentState:
     rollback_target = state.get("review_rollback_target", "")
     rollback_group_index = _group_index_by_step_id(state, rollback_target) or 0
+    retained_step_results = _truncate_step_results_before_group(state, rollback_group_index)
     return {
         "current_group_index": rollback_group_index,
         "current_group_results": [],
@@ -713,7 +879,8 @@ async def _rollback_group(state: AgentState) -> AgentState:
         "review_reason": "",
         "review_failure_category": "",
         "review_rollback_target": "",
-        "step_results": _truncate_step_results_before_group(state, rollback_group_index),
+        "artifacts": _rebuild_artifacts_from_step_results(retained_step_results),
+        "step_results": retained_step_results,
         "step_retry_count": 0,
         "approval_response": "",
         "pending_approval_group": "",
@@ -726,7 +893,8 @@ async def _synthesizer(state: AgentState) -> AgentState:
         f"Latest user request:\n{_get_latest_user_input(state)}\n\n"
         f"Workflow reason:\n{state.get('route_reason', '')}\n\n"
         f"Workflow plan:\n{json.dumps(state.get('workflow_plan', []), ensure_ascii=False)}\n\n"
-        f"Accepted step results:\n{json.dumps(state.get('step_results', []), ensure_ascii=False)}"
+        f"Accepted step results:\n{json.dumps(state.get('step_results', []), ensure_ascii=False)}\n\n"
+        f"Artifacts:\n{_artifact_context_text(state)}"
     )
     final_reply = await _call_text_model(SYNTHESIZER_PROMPT, user_prompt)
     return {
@@ -875,6 +1043,7 @@ async def run_agent_graph(
             "messages": [{"role": "user", "content": user_input}],
             "session_id": session_id,
             "document_id": document_id,
+            "artifacts": {},
             "workflow_status": "planning",
             "workflow_plan": [],
             "success_criteria": [],
@@ -909,6 +1078,7 @@ async def resume_agent_graph(
         {
             "messages": [{"role": "user", "content": user_input}] if user_input else [],
             "session_id": session_id,
+            "artifacts": {},
             "workflow_status": "resume",
             "approval_response": approval_response,
             "final_reply": "",

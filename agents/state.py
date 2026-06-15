@@ -18,6 +18,8 @@ class AgentState(TypedDict, total=False):
     current_step_goal: str
     review_decision: str
     review_reason: str
+    review_failure_category: str
+    review_rollback_target: str
     step_results: list[dict[str, Any]]
     step_retry_count: int
     tool_iterations: int

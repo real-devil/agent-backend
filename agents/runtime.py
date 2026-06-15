@@ -36,6 +36,7 @@ Rules:
 - Return JSON only.
 - Use 1-6 steps.
 - Steps with the same parallel_group can be executed in parallel.
+- Each step may declare depends_on as a list of prior step IDs.
 - Set approval_required=true for risky, ambiguous, high-cost, or externally consequential steps.
 - If a document_id is present, prefer rag_agent or tool_agent/search_documents when useful.
 - The final user-facing answer will be written later by a synthesizer node.
@@ -51,7 +52,9 @@ Schema:
       "agent": "research_agent" | "tool_agent" | "rag_agent" | "general_agent",
       "goal": "what this step should achieve",
       "parallel_group": 0,
-      "approval_required": false
+      "approval_required": false,
+      "depends_on": ["step_0"],
+      "output_key": "short_machine_readable_name"
     }
   ]
 }
@@ -83,13 +86,16 @@ Inspect the current group results and decide whether to continue, retry, or fini
 Return JSON only with this schema:
 {
   "decision": "continue" | "retry" | "finish",
-  "reason": "short explanation"
+  "reason": "short explanation",
+  "failure_category": "none" | "missing_info" | "tool_failure" | "low_confidence" | "invalid_plan",
+  "rollback_to_step_id": "optional previous step id"
 }
 
 Guidance:
 - retry: the current group result is unusable or clearly insufficient
 - continue: the current group is acceptable and the workflow should move to the next group
 - finish: the workflow already has enough information to produce the final answer
+- Use rollback_to_step_id only when the workflow should restart from an earlier accepted step group
 """.strip()
 
 SYNTHESIZER_PROMPT = """
@@ -254,6 +260,8 @@ def _fallback_plan(state: AgentState) -> dict[str, Any]:
                 "goal": _get_latest_user_input(state),
                 "parallel_group": 0,
                 "approval_required": False,
+                "depends_on": [],
+                "output_key": "document_answer",
             }
         ]
         reason = "Document-specific request routed to rag_agent."
@@ -265,6 +273,8 @@ def _fallback_plan(state: AgentState) -> dict[str, Any]:
                 "goal": _get_latest_user_input(state),
                 "parallel_group": 0,
                 "approval_required": False,
+                "depends_on": [],
+                "output_key": "tool_result",
             }
         ]
         reason = "Weather-style request routed to tool_agent."
@@ -276,6 +286,8 @@ def _fallback_plan(state: AgentState) -> dict[str, Any]:
                 "goal": _get_latest_user_input(state),
                 "parallel_group": 0,
                 "approval_required": False,
+                "depends_on": [],
+                "output_key": "general_answer",
             }
         ]
         reason = "Fallback single-step general workflow."
@@ -293,8 +305,14 @@ def _normalize_plan(payload: dict[str, Any], state: AgentState) -> dict[str, Any
         payload = _fallback_plan(state)
 
     steps: list[dict[str, Any]] = []
+    known_ids: list[str] = []
     for index, raw_step in enumerate(payload.get("steps", []), start=1):
-        agent = str(raw_step.get("agent", "general_agent"))
+        step_id = str(raw_step.get("id", f"step_{index}")).strip() or f"step_{index}"
+        if step_id in known_ids:
+            step_id = f"{step_id}_{index}"
+        known_ids.append(step_id)
+
+        agent = str(raw_step.get("agent", "general_agent")).strip()
         if agent not in {"research_agent", "tool_agent", "rag_agent", "general_agent"}:
             agent = "general_agent"
         goal = str(raw_step.get("goal", "")).strip() or _get_latest_user_input(state)
@@ -303,13 +321,20 @@ def _normalize_plan(payload: dict[str, Any], state: AgentState) -> dict[str, Any
             parallel_group = int(parallel_group)
         except (TypeError, ValueError):
             parallel_group = index - 1
+        raw_depends_on = raw_step.get("depends_on", [])
+        depends_on = []
+        if isinstance(raw_depends_on, list):
+            depends_on = [str(dep) for dep in raw_depends_on if str(dep) in known_ids[:-1]]
+        output_key = str(raw_step.get("output_key", f"{step_id}_output")).strip() or f"{step_id}_output"
         steps.append(
             {
-                "id": str(raw_step.get("id", f"step_{index}")),
+                "id": step_id,
                 "agent": agent,
                 "goal": goal,
                 "parallel_group": parallel_group,
                 "approval_required": bool(raw_step.get("approval_required", False)),
+                "depends_on": depends_on,
+                "output_key": output_key,
             }
         )
 
@@ -317,6 +342,18 @@ def _normalize_plan(payload: dict[str, Any], state: AgentState) -> dict[str, Any
         fallback = _fallback_plan(state)
         steps = fallback["steps"]
         payload = fallback
+
+    group_by_step_id: dict[str, int] = {}
+    for step in steps:
+        if step["depends_on"]:
+            inherited_group = max(group_by_step_id[dep] for dep in step["depends_on"]) + 1
+            step["parallel_group"] = max(step["parallel_group"], inherited_group)
+        group_by_step_id[step["id"]] = step["parallel_group"]
+
+    ordered_groups = sorted({int(step["parallel_group"]) for step in steps})
+    compact_group_map = {group: index for index, group in enumerate(ordered_groups)}
+    for step in steps:
+        step["parallel_group"] = compact_group_map[int(step["parallel_group"])]
 
     return {
         "workflow_status": payload.get("workflow_status", "multi_step" if len(steps) > 1 else "simple"),
@@ -335,6 +372,25 @@ def _ordered_group_ids(state: AgentState) -> list[int]:
         if group not in groups:
             groups.append(group)
     return groups or [0]
+
+
+def _group_index_by_step_id(state: AgentState, step_id: str) -> int | None:
+    ordered_groups = _ordered_group_ids(state)
+    group_id_to_index = {group_id: index for index, group_id in enumerate(ordered_groups)}
+    for step in state.get("workflow_plan", []):
+        if step["id"] == step_id:
+            return group_id_to_index.get(int(step.get("parallel_group", 0)))
+    return None
+
+
+def _truncate_step_results_before_group(state: AgentState, target_group_index: int) -> list[dict[str, Any]]:
+    allowed_group_ids = set(_ordered_group_ids(state)[:target_group_index])
+    retained: list[dict[str, Any]] = []
+    for result in state.get("step_results", []):
+        group_index = _group_index_by_step_id(state, str(result.get("step_id", "")))
+        if group_index is not None and group_index in allowed_group_ids:
+            retained.append(result)
+    return retained
 
 
 def _get_current_group_id(state: AgentState) -> int:
@@ -387,6 +443,8 @@ async def _planner(state: AgentState) -> AgentState:
         "current_step_goal": "",
         "review_decision": "",
         "review_reason": "",
+        "review_failure_category": "",
+        "review_rollback_target": "",
         "step_results": [],
         "step_retry_count": 0,
         "tool_iterations": 0,
@@ -435,6 +493,8 @@ async def _approval_gate(state: AgentState) -> AgentState:
         "workflow_status": "in_progress",
         "pending_approval_group": "",
         "approval_response": "",
+        "review_failure_category": "",
+        "review_rollback_target": "",
         "final_reply": "",
     }
 
@@ -588,13 +648,23 @@ async def _reviewer(state: AgentState) -> AgentState:
     payload = _parse_json_object(await _call_text_model(REVIEWER_PROMPT, user_prompt))
     decision = str(payload.get("decision", "continue")).lower()
     reason = str(payload.get("reason", "")).strip() or "Reviewer decision applied."
+    failure_category = str(payload.get("failure_category", "none")).strip().lower() or "none"
+    rollback_to_step_id = str(payload.get("rollback_to_step_id", "")).strip()
     if decision not in {"continue", "retry", "finish"}:
         decision = "continue"
+    if failure_category not in {"none", "missing_info", "tool_failure", "low_confidence", "invalid_plan"}:
+        failure_category = "none"
+    if rollback_to_step_id and _group_index_by_step_id(state, rollback_to_step_id) is None:
+        rollback_to_step_id = ""
 
     retry_count = state.get("step_retry_count", 0)
     if decision == "retry" and retry_count >= MAX_STEP_RETRIES:
-        decision = "continue" if _has_remaining_groups(state) else "finish"
-        reason = "Retry limit reached; proceeding with the workflow."
+        rollback_group_index = _group_index_by_step_id(state, rollback_to_step_id) if rollback_to_step_id else None
+        if rollback_group_index is not None and rollback_group_index < state.get("current_group_index", 0):
+            reason = "Retry limit reached; rolling workflow back to an earlier group."
+        else:
+            decision = "continue" if _has_remaining_groups(state) else "finish"
+            reason = "Retry limit reached; proceeding with the workflow."
     if decision == "continue" and not _has_remaining_groups(state):
         decision = "finish"
 
@@ -605,6 +675,8 @@ async def _reviewer(state: AgentState) -> AgentState:
     return {
         "review_decision": decision,
         "review_reason": reason,
+        "review_failure_category": failure_category,
+        "review_rollback_target": rollback_to_step_id,
         "step_results": step_results,
         "step_retry_count": retry_count + 1 if decision == "retry" else 0,
     }
@@ -619,6 +691,29 @@ async def _advance_group(state: AgentState) -> AgentState:
         "current_step_goal": "",
         "review_decision": "",
         "review_reason": "",
+        "review_failure_category": "",
+        "review_rollback_target": "",
+        "step_retry_count": 0,
+        "approval_response": "",
+        "pending_approval_group": "",
+        "final_reply": "",
+    }
+
+
+async def _rollback_group(state: AgentState) -> AgentState:
+    rollback_target = state.get("review_rollback_target", "")
+    rollback_group_index = _group_index_by_step_id(state, rollback_target) or 0
+    return {
+        "current_group_index": rollback_group_index,
+        "current_group_results": [],
+        "current_step_result": "",
+        "current_step_agent": "",
+        "current_step_goal": "",
+        "review_decision": "",
+        "review_reason": "",
+        "review_failure_category": "",
+        "review_rollback_target": "",
+        "step_results": _truncate_step_results_before_group(state, rollback_group_index),
         "step_retry_count": 0,
         "approval_response": "",
         "pending_approval_group": "",
@@ -657,6 +752,9 @@ def _route_after_approval_gate(state: AgentState) -> str:
 def _route_after_review(state: AgentState) -> str:
     decision = state.get("review_decision", "continue")
     if decision == "retry":
+        rollback_group_index = _group_index_by_step_id(state, state.get("review_rollback_target", ""))
+        if rollback_group_index is not None and rollback_group_index < state.get("current_group_index", 0):
+            return "rollback_group"
         return "approval_gate"
     if decision == "continue":
         return "advance_group"
@@ -675,6 +773,7 @@ def build_agent_graph(checkpointer: Any):
     graph.add_node("execute_group", _execute_group)
     graph.add_node("reviewer", _reviewer)
     graph.add_node("advance_group", _advance_group)
+    graph.add_node("rollback_group", _rollback_group)
     graph.add_node("synthesizer", _synthesizer)
 
     graph.add_edge(START, "entry")
@@ -702,11 +801,19 @@ def build_agent_graph(checkpointer: Any):
         {
             "approval_gate": "approval_gate",
             "advance_group": "advance_group",
+            "rollback_group": "rollback_group",
             "synthesizer": "synthesizer",
         },
     )
     graph.add_conditional_edges(
         "advance_group",
+        _route_after_advance,
+        {
+            "approval_gate": "approval_gate",
+        },
+    )
+    graph.add_conditional_edges(
+        "rollback_group",
         _route_after_advance,
         {
             "approval_gate": "approval_gate",
@@ -778,6 +885,8 @@ async def run_agent_graph(
             "current_step_goal": "",
             "review_decision": "",
             "review_reason": "",
+            "review_failure_category": "",
+            "review_rollback_target": "",
             "step_results": [],
             "step_retry_count": 0,
             "tool_iterations": 0,

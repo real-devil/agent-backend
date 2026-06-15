@@ -1,3 +1,4 @@
+from typing import Any
 from uuid import uuid4
 
 from agents.runtime import get_workflow_snapshot, resume_agent_graph, run_agent_graph
@@ -30,7 +31,7 @@ async def resume_agent_session(
     return {"reply": reply, "session_id": session_id}
 
 
-async def get_agent_session_state(session_id: str) -> dict[str, str | int | list | None]:
+async def get_agent_session_state(session_id: str) -> dict[str, Any]:
     snapshot = await get_workflow_snapshot(session_id)
     return {
         "session_id": session_id,
@@ -41,5 +42,6 @@ async def get_agent_session_state(session_id: str) -> dict[str, str | int | list
         "review_decision": snapshot.get("review_decision"),
         "review_reason": snapshot.get("review_reason"),
         "artifacts": snapshot.get("artifacts"),
+        "workflow_trace": snapshot.get("workflow_trace"),
         "workflow_plan": snapshot.get("workflow_plan"),
     }

@@ -4,6 +4,7 @@ from typing import Annotated, Any, TypedDict
 
 class AgentState(TypedDict, total=False):
     messages: Annotated[list[dict[str, Any]], add]
+    workflow_trace: Annotated[list[dict[str, Any]], add]
     session_id: str | None
     document_id: str | None
     route_reason: str

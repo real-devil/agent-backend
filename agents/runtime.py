@@ -9,6 +9,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from openai import AsyncOpenAI
 
+from agents.schemas import ArtifactRecord, ReviewPayload, StepSpec, StructuredStepOutput, TraceEvent
 from agents.state import AgentState
 from services.rag import rag_chat
 from tools.search import SEARCH_TOOL, search_documents
@@ -267,30 +268,38 @@ def _artifact_context_text(state: AgentState) -> str:
     return json.dumps(artifacts, ensure_ascii=False)
 
 
+def _trace_event(node: str, event_type: str, **detail: Any) -> list[dict[str, Any]]:
+    return [TraceEvent(event_type=event_type, node=node, detail=detail).model_dump()]
+
+
 def _parse_structured_step_output(raw_content: str, output_key: str) -> dict[str, Any]:
     payload = _parse_json_object(raw_content)
     if not payload:
-        return {
-            "summary": raw_content.strip() or output_key,
-            "artifact_type": "analysis",
-            "artifact_data": raw_content.strip(),
-            "confidence": "medium",
-        }
+        return StructuredStepOutput(
+            summary=raw_content.strip() or output_key,
+            artifact_type="analysis",
+            artifact_data=raw_content.strip(),
+            confidence="medium",
+        ).model_dump()
 
     summary = str(payload.get("summary", "")).strip() or output_key
     artifact_type = str(payload.get("artifact_type", "analysis")).strip().lower() or "analysis"
-    if artifact_type not in {"notes", "facts", "answer", "analysis", "tool_result"}:
-        artifact_type = "analysis"
     confidence = str(payload.get("confidence", "medium")).strip().lower() or "medium"
-    if confidence not in {"high", "medium", "low"}:
-        confidence = "medium"
 
-    return {
-        "summary": summary,
-        "artifact_type": artifact_type,
-        "artifact_data": payload.get("artifact_data", summary),
-        "confidence": confidence,
-    }
+    try:
+        return StructuredStepOutput(
+            summary=summary,
+            artifact_type=artifact_type,
+            artifact_data=payload.get("artifact_data", summary),
+            confidence=confidence,
+        ).model_dump()
+    except Exception:
+        return StructuredStepOutput(
+            summary=summary,
+            artifact_type="analysis",
+            artifact_data=payload.get("artifact_data", summary),
+            confidence="medium",
+        ).model_dump()
 
 
 def _build_artifact_record(
@@ -302,15 +311,15 @@ def _build_artifact_record(
     artifact_data: Any,
     confidence: str,
 ) -> dict[str, Any]:
-    return {
-        "step_id": step["id"],
-        "output_key": step["output_key"],
-        "agent": agent,
-        "artifact_type": artifact_type,
-        "summary": summary,
-        "confidence": confidence,
-        "data": artifact_data,
-    }
+    return ArtifactRecord(
+        step_id=step["id"],
+        output_key=step["output_key"],
+        agent=agent,
+        artifact_type=artifact_type,
+        summary=summary,
+        confidence=confidence,
+        data=artifact_data,
+    ).model_dump()
 
 
 def _rebuild_artifacts_from_step_results(step_results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -400,15 +409,15 @@ def _normalize_plan(payload: dict[str, Any], state: AgentState) -> dict[str, Any
             depends_on = [str(dep) for dep in raw_depends_on if str(dep) in known_ids[:-1]]
         output_key = str(raw_step.get("output_key", f"{step_id}_output")).strip() or f"{step_id}_output"
         steps.append(
-            {
-                "id": step_id,
-                "agent": agent,
-                "goal": goal,
-                "parallel_group": parallel_group,
-                "approval_required": bool(raw_step.get("approval_required", False)),
-                "depends_on": depends_on,
-                "output_key": output_key,
-            }
+            StepSpec(
+                id=step_id,
+                agent=agent,
+                goal=goal,
+                parallel_group=parallel_group,
+                approval_required=bool(raw_step.get("approval_required", False)),
+                depends_on=depends_on,
+                output_key=output_key,
+            ).model_dump()
         )
 
     if not steps:
@@ -524,6 +533,7 @@ async def _planner(state: AgentState) -> AgentState:
     plan = _normalize_plan(_parse_json_object(raw_content), state)
     return {
         "artifacts": {},
+        "workflow_trace": _trace_event("planner", "plan_created", step_count=len(plan["steps"]), workflow_status=plan["workflow_status"]),
         "workflow_status": plan["workflow_status"],
         "workflow_plan": plan["steps"],
         "route_reason": plan["route_reason"],
@@ -551,6 +561,7 @@ async def _approval_gate(state: AgentState) -> AgentState:
     requires_approval = any(bool(step.get("approval_required")) for step in current_steps)
     if not requires_approval:
         return {
+            "workflow_trace": _trace_event("approval_gate", "approval_skipped", group_id=_get_current_group_id(state)),
             "workflow_status": "in_progress",
             "pending_approval_group": "",
             "approval_response": "",
@@ -562,6 +573,7 @@ async def _approval_gate(state: AgentState) -> AgentState:
     if approval_response in APPROVAL_REJECTED:
         message = f"Workflow stopped because approval was rejected for group {current_group}."
         return {
+            "workflow_trace": _trace_event("approval_gate", "approval_rejected", group_id=current_group),
             "workflow_status": "rejected",
             "pending_approval_group": current_group,
             "final_reply": message,
@@ -575,6 +587,7 @@ async def _approval_gate(state: AgentState) -> AgentState:
             f"Pending goals: {goals}"
         )
         return {
+            "workflow_trace": _trace_event("approval_gate", "approval_requested", group_id=current_group, goals=goals),
             "workflow_status": "awaiting_approval",
             "pending_approval_group": current_group,
             "final_reply": message,
@@ -582,6 +595,7 @@ async def _approval_gate(state: AgentState) -> AgentState:
         }
 
     return {
+        "workflow_trace": _trace_event("approval_gate", "approval_granted", group_id=current_group),
         "workflow_status": "in_progress",
         "pending_approval_group": "",
         "approval_response": "",
@@ -792,6 +806,12 @@ async def _execute_group(state: AgentState) -> AgentState:
         "current_step_agent": "parallel_group" if len(results) > 1 else results[0]["agent"],
         "current_step_goal": "; ".join(step["goal"] for step in steps),
         "tool_iterations": 0,
+        "workflow_trace": _trace_event(
+            "execute_group",
+            "group_executed",
+            group_id=_get_current_group_id(state),
+            step_ids=[result["step_id"] for result in results],
+        ),
         "final_reply": "",
     }
 
@@ -808,14 +828,25 @@ async def _reviewer(state: AgentState) -> AgentState:
         f"Has remaining groups after this one: {'yes' if _has_remaining_groups(state) else 'no'}"
     )
     payload = _parse_json_object(await _call_text_model(REVIEWER_PROMPT, user_prompt))
-    decision = str(payload.get("decision", "continue")).lower()
-    reason = str(payload.get("reason", "")).strip() or "Reviewer decision applied."
-    failure_category = str(payload.get("failure_category", "none")).strip().lower() or "none"
-    rollback_to_step_id = str(payload.get("rollback_to_step_id", "")).strip()
-    if decision not in {"continue", "retry", "finish"}:
-        decision = "continue"
-    if failure_category not in {"none", "missing_info", "tool_failure", "low_confidence", "invalid_plan"}:
-        failure_category = "none"
+    try:
+        review_payload = ReviewPayload(
+            decision=str(payload.get("decision", "continue")).lower(),
+            reason=str(payload.get("reason", "")).strip() or "Reviewer decision applied.",
+            failure_category=str(payload.get("failure_category", "none")).strip().lower() or "none",
+            rollback_to_step_id=str(payload.get("rollback_to_step_id", "")).strip(),
+        )
+    except Exception:
+        review_payload = ReviewPayload(
+            decision="continue",
+            reason="Reviewer decision applied.",
+            failure_category="none",
+            rollback_to_step_id="",
+        )
+
+    decision = review_payload.decision
+    reason = review_payload.reason
+    failure_category = review_payload.failure_category
+    rollback_to_step_id = review_payload.rollback_to_step_id
     if rollback_to_step_id and _group_index_by_step_id(state, rollback_to_step_id) is None:
         rollback_to_step_id = ""
 
@@ -844,6 +875,13 @@ async def _reviewer(state: AgentState) -> AgentState:
         "artifacts": artifacts,
         "step_results": step_results,
         "step_retry_count": retry_count + 1 if decision == "retry" else 0,
+        "workflow_trace": _trace_event(
+            "reviewer",
+            "review_completed",
+            decision=decision,
+            failure_category=failure_category,
+            rollback_to_step_id=rollback_to_step_id,
+        ),
     }
 
 
@@ -861,6 +899,11 @@ async def _advance_group(state: AgentState) -> AgentState:
         "step_retry_count": 0,
         "approval_response": "",
         "pending_approval_group": "",
+        "workflow_trace": _trace_event(
+            "advance_group",
+            "group_advanced",
+            next_group_index=state.get("current_group_index", 0) + 1,
+        ),
         "final_reply": "",
     }
 
@@ -884,6 +927,12 @@ async def _rollback_group(state: AgentState) -> AgentState:
         "step_retry_count": 0,
         "approval_response": "",
         "pending_approval_group": "",
+        "workflow_trace": _trace_event(
+            "rollback_group",
+            "workflow_rolled_back",
+            rollback_target=rollback_target,
+            rollback_group_index=rollback_group_index,
+        ),
         "final_reply": "",
     }
 
@@ -900,6 +949,7 @@ async def _synthesizer(state: AgentState) -> AgentState:
     return {
         "final_reply": final_reply,
         "workflow_status": "completed",
+        "workflow_trace": _trace_event("synthesizer", "final_answer_created"),
         "messages": [{"role": "assistant", "content": final_reply}],
     }
 
@@ -1044,6 +1094,7 @@ async def run_agent_graph(
             "session_id": session_id,
             "document_id": document_id,
             "artifacts": {},
+            "workflow_trace": _trace_event("entry", "workflow_started"),
             "workflow_status": "planning",
             "workflow_plan": [],
             "success_criteria": [],
@@ -1078,7 +1129,7 @@ async def resume_agent_graph(
         {
             "messages": [{"role": "user", "content": user_input}] if user_input else [],
             "session_id": session_id,
-            "artifacts": {},
+            "workflow_trace": _trace_event("entry", "workflow_resumed", approval_response=approval_response),
             "workflow_status": "resume",
             "approval_response": approval_response,
             "final_reply": "",

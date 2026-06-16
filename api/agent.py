@@ -1,7 +1,14 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
+from starlette.responses import StreamingResponse
 
-from agents.service import get_agent_session_state, resume_agent_session, run_agent_session
+from agents.service import (
+    get_agent_session_state,
+    resume_agent_session,
+    run_agent_session,
+    stream_agent_session,
+    stream_resume_agent_session,
+)
 
 router = APIRouter()
 
@@ -27,12 +34,36 @@ async def run_agent(request: AgentRequest):
     )
 
 
+@router.post("/stream")
+async def stream_agent(request: AgentRequest):
+    return StreamingResponse(
+        stream_agent_session(
+            user_input=request.input,
+            session_id=request.session_id,
+            document_id=request.document_id,
+        ),
+        media_type="text/event-stream",
+    )
+
+
 @router.post("/resume")
 async def resume_agent(request: AgentResumeRequest):
     return await resume_agent_session(
         session_id=request.session_id,
         approval_response=request.approval_response,
         user_input=request.input,
+    )
+
+
+@router.post("/resume/stream")
+async def stream_resume_agent(request: AgentResumeRequest):
+    return StreamingResponse(
+        stream_resume_agent_session(
+            session_id=request.session_id,
+            approval_response=request.approval_response,
+            user_input=request.input,
+        ),
+        media_type="text/event-stream",
     )
 
 

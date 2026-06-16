@@ -279,6 +279,18 @@ def _trace_event(node: str, event_type: str, **detail: Any) -> list[dict[str, An
     return [TraceEvent(event_type=event_type, node=node, detail=detail).model_dump()]
 
 
+def _step_trace_event(step: dict[str, Any], event_type: str, **detail: Any) -> list[dict[str, Any]]:
+    return _trace_event(
+        step.get("agent", "step"),
+        event_type,
+        step_id=step.get("id"),
+        goal=step.get("goal"),
+        output_key=step.get("output_key"),
+        parallel_group=step.get("parallel_group"),
+        **detail,
+    )
+
+
 def _default_metrics_summary() -> dict[str, Any]:
     return MetricsSummary().model_dump()
 
@@ -609,6 +621,17 @@ async def _planner(state: AgentState) -> AgentState:
             "plan_created",
             step_count=len(plan["steps"]),
             workflow_status=plan["workflow_status"],
+            route_reason=plan["route_reason"],
+            user_request=_get_latest_user_input(state),
+            steps=[
+                {
+                    "id": step["id"],
+                    "agent": step["agent"],
+                    "goal": step["goal"],
+                    "group": step["parallel_group"],
+                }
+                for step in plan["steps"]
+            ],
             duration_ms=meta["duration_ms"],
             usage=meta["usage"],
         ),
@@ -697,6 +720,8 @@ async def _approval_gate(state: AgentState) -> AgentState:
 
 
 async def _run_research_step(step: dict[str, Any], state: AgentState) -> dict[str, Any]:
+    trace_events: list[dict[str, Any]] = []
+    trace_events += _step_trace_event(step, "step_started", agent="research_agent")
     if state.get("document_id"):
         started = time.perf_counter()
         result = await search_documents(query=step["goal"], document_id=state["document_id"])
@@ -733,6 +758,15 @@ async def _run_research_step(step: dict[str, Any], state: AgentState) -> dict[st
         artifact_data=parsed["artifact_data"],
         confidence=str(parsed["confidence"]),
     )
+    trace_events += _step_trace_event(
+        step,
+        "step_completed",
+        agent="research_agent",
+        duration_ms=duration_ms,
+        summary=str(parsed["summary"]),
+        confidence=str(parsed["confidence"]),
+        usage=usage,
+    )
     return {
         "step_id": step["id"],
         "output_key": step["output_key"],
@@ -740,6 +774,7 @@ async def _run_research_step(step: dict[str, Any], state: AgentState) -> dict[st
         "goal": step["goal"],
         "result": result,
         "artifact": artifact,
+        "trace_events": trace_events,
         "metrics": {
             "duration_ms": duration_ms,
             "usage": usage,
@@ -760,6 +795,8 @@ async def _tool_execute(name: str, args: dict[str, Any], state: AgentState) -> s
 
 
 async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, Any]:
+    trace_events: list[dict[str, Any]] = []
+    trace_events += _step_trace_event(step, "step_started", agent="tool_agent")
     local_messages: list[dict[str, Any]] = [
         {"role": "system", "content": f"{TOOL_AGENT_PROMPT}\n\n{STRUCTURED_STEP_OUTPUT_PROMPT}"},
         {
@@ -808,6 +845,13 @@ async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, A
             tool_call_count += 1
             fn_name = tool_call["function"]["name"]
             raw_args = tool_call["function"]["arguments"]
+            trace_events += _step_trace_event(
+                step,
+                "tool_called",
+                agent="tool_agent",
+                tool_name=fn_name,
+                tool_args=raw_args,
+            )
             try:
                 fn_args = json.loads(raw_args) if raw_args else {}
             except json.JSONDecodeError as exc:
@@ -815,6 +859,13 @@ async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, A
             else:
                 tool_result = await _tool_execute(fn_name, fn_args, state)
                 logger.info("tool_agent %s(%s) => %s", fn_name, fn_args, tool_result)
+            trace_events += _step_trace_event(
+                step,
+                "tool_result",
+                agent="tool_agent",
+                tool_name=fn_name,
+                result_preview=str(tool_result)[:400],
+            )
             local_messages.append(
                 {
                     "role": "tool",
@@ -830,6 +881,16 @@ async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, A
         artifact_data=final_parsed["artifact_data"],
         confidence=str(final_parsed["confidence"]),
     )
+    trace_events += _step_trace_event(
+        step,
+        "step_completed",
+        agent="tool_agent",
+        duration_ms=total_duration_ms,
+        summary=str(final_parsed["summary"]),
+        confidence=str(final_parsed["confidence"]),
+        usage=total_usage,
+        tool_calls=tool_call_count,
+    )
     return {
         "step_id": step["id"],
         "output_key": step["output_key"],
@@ -837,6 +898,7 @@ async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, A
         "goal": step["goal"],
         "result": str(final_parsed["summary"]),
         "artifact": artifact,
+        "trace_events": trace_events,
         "metrics": {
             "duration_ms": total_duration_ms,
             "usage": total_usage,
@@ -847,6 +909,8 @@ async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, A
 
 
 async def _run_rag_step(step: dict[str, Any], state: AgentState) -> dict[str, Any]:
+    trace_events: list[dict[str, Any]] = []
+    trace_events += _step_trace_event(step, "step_started", agent="rag_agent")
     started = time.perf_counter()
     result = await rag_chat(question=step["goal"], document_id=state.get("document_id"))
     duration_ms = int((time.perf_counter() - started) * 1000)
@@ -858,6 +922,14 @@ async def _run_rag_step(step: dict[str, Any], state: AgentState) -> dict[str, An
         artifact_data=result or "",
         confidence="medium",
     )
+    trace_events += _step_trace_event(
+        step,
+        "step_completed",
+        agent="rag_agent",
+        duration_ms=duration_ms,
+        summary=(result or "")[:300],
+        confidence="medium",
+    )
     return {
         "step_id": step["id"],
         "output_key": step["output_key"],
@@ -865,6 +937,7 @@ async def _run_rag_step(step: dict[str, Any], state: AgentState) -> dict[str, An
         "goal": step["goal"],
         "result": result or "",
         "artifact": artifact,
+        "trace_events": trace_events,
         "metrics": {
             "duration_ms": duration_ms,
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
@@ -875,6 +948,8 @@ async def _run_rag_step(step: dict[str, Any], state: AgentState) -> dict[str, An
 
 
 async def _run_general_step(step: dict[str, Any], state: AgentState) -> dict[str, Any]:
+    trace_events: list[dict[str, Any]] = []
+    trace_events += _step_trace_event(step, "step_started", agent="general_agent")
     structured_payload, meta = await _call_structured_step_model(
         GENERAL_AGENT_PROMPT,
         (
@@ -896,6 +971,15 @@ async def _run_general_step(step: dict[str, Any], state: AgentState) -> dict[str
         artifact_data=parsed["artifact_data"],
         confidence=str(parsed["confidence"]),
     )
+    trace_events += _step_trace_event(
+        step,
+        "step_completed",
+        agent="general_agent",
+        duration_ms=meta["duration_ms"],
+        summary=str(parsed["summary"]),
+        confidence=str(parsed["confidence"]),
+        usage=meta["usage"],
+    )
     return {
         "step_id": step["id"],
         "output_key": step["output_key"],
@@ -903,6 +987,7 @@ async def _run_general_step(step: dict[str, Any], state: AgentState) -> dict[str
         "goal": step["goal"],
         "result": str(parsed["summary"]),
         "artifact": artifact,
+        "trace_events": trace_events,
         "metrics": {
             "duration_ms": meta["duration_ms"],
             "usage": meta["usage"],
@@ -926,6 +1011,21 @@ async def _dispatch_step(step: dict[str, Any], state: AgentState) -> dict[str, A
 async def _execute_group(state: AgentState) -> AgentState:
     steps = _get_current_group_steps(state)
     results = await asyncio.gather(*[_dispatch_step(step, state) for step in steps])
+    group_trace_events = _trace_event(
+        "execute_group",
+        "group_started",
+        group_id=_get_current_group_id(state),
+        steps=[
+            {
+                "step_id": step["id"],
+                "agent": step["agent"],
+                "goal": step["goal"],
+            }
+            for step in steps
+        ],
+    )
+    for result in results:
+        group_trace_events += result.get("trace_events", [])
     combined_text = "\n\n".join(
         f"[{result['step_id']} - {result['agent']}]\n{result['result']}" for result in results
     )
@@ -952,7 +1052,8 @@ async def _execute_group(state: AgentState) -> AgentState:
         "current_step_agent": "parallel_group" if len(results) > 1 else results[0]["agent"],
         "current_step_goal": "; ".join(step["goal"] for step in steps),
         "tool_iterations": 0,
-        "workflow_trace": _trace_event(
+        "workflow_trace": group_trace_events
+        + _trace_event(
             "execute_group",
             "group_executed",
             group_id=_get_current_group_id(state),

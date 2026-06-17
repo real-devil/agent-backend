@@ -11,8 +11,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from openai import AsyncOpenAI
 
+from agents.routing import fallback_plan_for_intents, reconcile_plan_steps
 from agents.schemas import ArtifactRecord, MetricsSummary, ReviewPayload, StepSpec, StructuredStepOutput, TraceEvent
 from agents.state import AgentState
+from agents.trace_labels import format_step_label, resolve_trace_labels
 from services.rag import rag_chat
 from tools.search import SEARCH_TOOL, search_documents
 from tools.weather import WEATHER_TOOL, get_weather
@@ -43,7 +45,9 @@ Rules:
 - Steps with the same parallel_group can be executed in parallel.
 - Each step may declare depends_on as a list of prior step IDs.
 - Set approval_required=true for risky, ambiguous, high-cost, or externally consequential steps.
-- If a document_id is present, prefer rag_agent or tool_agent/search_documents when useful.
+- If a document_id is present, use rag_agent only for questions that should be answered from the uploaded document.
+- Use tool_agent for live or external data such as weather, even when document_id is present.
+- Never route weather or real-time lookups to rag_agent alone.
 - The final user-facing answer will be written later by a synthesizer node.
 
 Schema:
@@ -111,6 +115,7 @@ Guidance:
 - continue: the current group is acceptable and the workflow should move to the next group
 - finish: the workflow already has enough information to produce the final answer
 - Use rollback_to_step_id only when the workflow should restart from an earlier accepted step group
+- If a step used rag_agent but the result says the answer is not in the document, and the user asked for live/external facts such as weather, prefer retry and route the next attempt through tool_agent
 """.strip()
 
 SYNTHESIZER_PROMPT = """
@@ -283,11 +288,14 @@ def _trace_event(
     turn_id: str | None = None,
     **detail: Any,
 ) -> list[dict[str, Any]]:
+    display_label, activity_kind = resolve_trace_labels(node, event_type, detail)
     return [
         TraceEvent(
             event_type=event_type,
             node=node,
             turn_id=str(turn_id) if turn_id else None,
+            display_label=display_label,
+            activity_kind=activity_kind,
             detail=detail,
         ).model_dump()
     ]
@@ -434,53 +442,10 @@ def _rebuild_artifacts_from_step_results(step_results: list[dict[str, Any]]) -> 
 
 
 def _fallback_plan(state: AgentState) -> dict[str, Any]:
-    latest_input = _get_latest_user_input(state).lower()
-    if state.get("document_id"):
-        steps = [
-            {
-                "id": "step_1",
-                "agent": "rag_agent",
-                "goal": _get_latest_user_input(state),
-                "parallel_group": 0,
-                "approval_required": False,
-                "depends_on": [],
-                "output_key": "document_answer",
-            }
-        ]
-        reason = "Document-specific request routed to rag_agent."
-    elif any(keyword in latest_input for keyword in ("weather", "temperature", "forecast", "天气")):
-        steps = [
-            {
-                "id": "step_1",
-                "agent": "tool_agent",
-                "goal": _get_latest_user_input(state),
-                "parallel_group": 0,
-                "approval_required": False,
-                "depends_on": [],
-                "output_key": "tool_result",
-            }
-        ]
-        reason = "Weather-style request routed to tool_agent."
-    else:
-        steps = [
-            {
-                "id": "step_1",
-                "agent": "general_agent",
-                "goal": _get_latest_user_input(state),
-                "parallel_group": 0,
-                "approval_required": False,
-                "depends_on": [],
-                "output_key": "general_answer",
-            }
-        ]
-        reason = "Fallback single-step general workflow."
-
-    return {
-        "workflow_status": "simple",
-        "route_reason": reason,
-        "success_criteria": ["Produce a direct and accurate answer for the user."],
-        "steps": steps,
-    }
+    return fallback_plan_for_intents(
+        _get_latest_user_input(state),
+        has_document=bool(state.get("document_id")),
+    )
 
 
 def _normalize_plan(payload: dict[str, Any], state: AgentState) -> dict[str, Any]:
@@ -538,9 +503,17 @@ def _normalize_plan(payload: dict[str, Any], state: AgentState) -> dict[str, Any
     for step in steps:
         step["parallel_group"] = compact_group_map[int(step["parallel_group"])]
 
+    route_reason = str(payload.get("route_reason", "Planner generated workflow."))
+    steps, route_reason = reconcile_plan_steps(
+        steps,
+        _get_latest_user_input(state),
+        document_id=state.get("document_id"),
+        route_reason=route_reason,
+    )
+
     return {
         "workflow_status": payload.get("workflow_status", "multi_step" if len(steps) > 1 else "simple"),
-        "route_reason": str(payload.get("route_reason", "Planner generated workflow.")),
+        "route_reason": route_reason,
         "success_criteria": [
             str(item) for item in payload.get("success_criteria", []) if str(item).strip()
         ] or ["Answer the user's request accurately."],
@@ -660,6 +633,7 @@ async def _planner(state: AgentState) -> AgentState:
                     "agent": step["agent"],
                     "goal": step["goal"],
                     "group": step["parallel_group"],
+                    "display_label": format_step_label(step["agent"], step["goal"], step["id"]),
                 }
                 for step in plan["steps"]
             ],
@@ -1058,6 +1032,7 @@ async def _execute_group(state: AgentState) -> AgentState:
                 "step_id": step["id"],
                 "agent": step["agent"],
                 "goal": step["goal"],
+                "display_label": format_step_label(step["agent"], step["goal"], step["id"]),
             }
             for step in steps
         ],
@@ -1529,7 +1504,12 @@ async def run_agent_graph(
             "current_turn_started_at": time.time(),
             "turn_history": list(existing_state.get("turn_history") or []),
             "artifacts": {},
-            "workflow_trace": _trace_event("entry", "workflow_started", turn_id=new_turn_id),
+            "workflow_trace": _trace_event(
+                "entry",
+                "workflow_started",
+                turn_id=new_turn_id,
+                user_request=user_input,
+            ),
             "workflow_status": "planning",
             "workflow_plan": [],
             "success_criteria": [],

@@ -41,6 +41,18 @@ class TraceEvent(BaseModel):
     event_type: str
     node: str
     turn_id: str | None = None
+    display_label: str | None = None
+    activity_kind: Literal[
+        "session",
+        "plan",
+        "parallel",
+        "step",
+        "tool",
+        "approval",
+        "review",
+        "synthesize",
+        "system",
+    ] | None = None
     detail: dict[str, Any] = Field(default_factory=dict)
 
 

@@ -32,3 +32,4 @@ class AgentState(TypedDict, total=False):
     tool_iterations: int
     approval_response: str
     pending_approval_group: str
+    turn_thinking_log: list[dict[str, Any]]

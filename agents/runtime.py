@@ -14,6 +14,15 @@ from openai import AsyncOpenAI
 from agents.routing import fallback_plan_for_intents, reconcile_plan_steps
 from agents.schemas import ArtifactRecord, MetricsSummary, ReviewPayload, StepSpec, StructuredStepOutput, TraceEvent
 from agents.state import AgentState
+from agents.stream_buffer import (
+    append_reply,
+    append_thinking,
+    finish_reply,
+    finish_thinking,
+    reset_session_streams,
+    start_reply,
+    start_thinking,
+)
 from agents.trace_labels import format_step_label, resolve_trace_labels
 from services.rag import rag_chat
 from tools.search import SEARCH_TOOL, search_documents
@@ -29,6 +38,8 @@ WORKFLOW_TIMEOUT_MS = 300_000
 APPROVAL_APPROVED = {"approved", "approve", "yes", "continue"}
 APPROVAL_REJECTED = {"rejected", "reject", "no", "deny", "denied", "stop"}
 
+PLAN_JSON_MARKER = "<plan_json>"
+
 PLANNER_PROMPT = """
 You are the planner and supervisor of a production multi-agent system.
 Break the user's request into a small executable workflow.
@@ -40,7 +51,6 @@ Available agents:
 - general_agent: reasoning, writing, transformation, or synthesis without tools
 
 Rules:
-- Return JSON only.
 - Use 1-6 steps.
 - Steps with the same parallel_group can be executed in parallel.
 - Each step may declare depends_on as a list of prior step IDs.
@@ -49,8 +59,13 @@ Rules:
 - Use tool_agent for live or external data such as weather, even when document_id is present.
 - Never route weather or real-time lookups to rag_agent alone.
 - The final user-facing answer will be written later by a synthesizer node.
+- Write the thinking section in the same language as the user's latest request.
 
-Schema:
+Output format (strict):
+<thinking>
+2-5 short sentences explaining what the user wants, how you will route the workflow, and which agents you will use.
+</thinking>
+<plan_json>
 {
   "workflow_status": "simple" | "multi_step",
   "route_reason": "short explanation",
@@ -67,6 +82,7 @@ Schema:
     }
   ]
 }
+</plan_json>
 """.strip()
 
 RESEARCH_AGENT_PROMPT = """
@@ -574,6 +590,110 @@ def _has_remaining_groups(state: AgentState) -> bool:
     return state.get("current_group_index", 0) + 1 < len(_ordered_group_ids(state))
 
 
+async def _stream_text_model(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    on_delta: Any | None = None,
+) -> tuple[str, dict[str, Any]]:
+    started = time.perf_counter()
+    stream = await _get_client().chat.completions.create(
+        model=_get_model_name(),
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        stream=True,
+    )
+    parts: list[str] = []
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    async for chunk in stream:
+        delta = chunk.choices[0].delta.content or ""
+        if delta:
+            parts.append(delta)
+            if on_delta is not None:
+                on_delta(delta)
+        if getattr(chunk, "usage", None) is not None:
+            usage = _usage_to_dict(chunk.usage)
+
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    return "".join(parts), {"duration_ms": duration_ms, "usage": usage}
+
+
+def _extract_planner_thinking(raw_content: str) -> str:
+    if "<thinking>" in raw_content and "</thinking>" in raw_content:
+        return raw_content.split("<thinking>", 1)[1].split("</thinking>", 1)[0].strip()
+    if PLAN_JSON_MARKER in raw_content:
+        return raw_content.split(PLAN_JSON_MARKER, 1)[0].replace("<thinking>", "").strip()
+    return ""
+
+
+def _parse_planner_response(raw_content: str) -> dict[str, Any]:
+    if PLAN_JSON_MARKER in raw_content:
+        json_part = raw_content.split(PLAN_JSON_MARKER, 1)[1]
+        json_part = json_part.replace("</plan_json>", "").strip()
+        if json_part.startswith("```"):
+            json_part = json_part.strip("`")
+            if json_part.startswith("json"):
+                json_part = json_part[4:].strip()
+        return _parse_json_object(json_part)
+    return _parse_json_object(raw_content)
+
+
+def _emit_planner_thinking_delta(session_id: str, buffer: str, emitted_len: int) -> int:
+    if not session_id:
+        return emitted_len
+
+    thinking_source = buffer
+    if PLAN_JSON_MARKER in thinking_source:
+        thinking_source = thinking_source.split(PLAN_JSON_MARKER, 1)[0]
+
+    partial_markers = (
+        PLAN_JSON_MARKER,
+        "<plan_json",
+        "<plan_js",
+        "<plan_j",
+        "<plan_",
+        "<plan",
+        "<pla",
+        "<pl",
+        "<p",
+        "<",
+    )
+    for marker in partial_markers:
+        if thinking_source.endswith(marker):
+            thinking_source = thinking_source[: -len(marker)]
+            break
+
+    thinking_text = (
+        thinking_source.replace("<thinking>", "").replace("</thinking>", "").strip()
+    )
+    if len(thinking_text) <= emitted_len:
+        return emitted_len
+
+    append_thinking(session_id, thinking_text[emitted_len:])
+    return len(thinking_text)
+
+
+async def _call_planner_model(state: AgentState, user_prompt: str) -> tuple[str, dict[str, Any]]:
+    session_id = str(state.get("session_id") or "")
+    turn_id = str(state.get("current_turn_id") or "")
+    start_thinking(session_id, turn_id, "planner")
+    buffer = ""
+    emitted_len = 0
+
+    def on_delta(delta: str) -> None:
+        nonlocal buffer, emitted_len
+        buffer += delta
+        emitted_len = _emit_planner_thinking_delta(session_id, buffer, emitted_len)
+
+    raw_content, meta = await _stream_text_model(PLANNER_PROMPT, user_prompt, on_delta=on_delta)
+    if session_id:
+        emitted_len = _emit_planner_thinking_delta(session_id, raw_content, emitted_len)
+        finish_thinking(session_id)
+    return raw_content, meta
+
+
 async def _call_text_model(system_prompt: str, user_prompt: str) -> tuple[str, dict[str, Any]]:
     started = time.perf_counter()
     response = await _get_client().chat.completions.create(
@@ -609,10 +729,15 @@ async def _planner(state: AgentState) -> AgentState:
         f"Conversation context:\n{_recent_conversation_text(state)}\n\n"
         f"document_id present: {'yes' if state.get('document_id') else 'no'}"
     )
-    raw_content, meta = await _call_text_model(PLANNER_PROMPT, user_prompt)
-    plan = _normalize_plan(_parse_json_object(raw_content), state)
+    raw_content, meta = await _call_planner_model(state, user_prompt)
+    plan = _normalize_plan(_parse_planner_response(raw_content), state)
+    planning_thought = _extract_planner_thinking(raw_content)
+    turn_thinking_log = list(state.get("turn_thinking_log") or [])
+    if planning_thought:
+        turn_thinking_log.append({"phase": "planner", "content": planning_thought})
     return {
         "artifacts": {},
+        "turn_thinking_log": turn_thinking_log,
         "metrics_summary": _merge_metrics(
             state.get("metrics_summary"),
             duration_ms=meta["duration_ms"],
@@ -1227,7 +1352,20 @@ async def _synthesizer(state: AgentState) -> AgentState:
         f"Accepted step results:\n{json.dumps(state.get('step_results', []), ensure_ascii=False)}\n\n"
         f"Artifacts:\n{_artifact_context_text(state)}"
     )
-    final_reply, meta = await _call_text_model(SYNTHESIZER_PROMPT, user_prompt)
+    session_id = str(state.get("session_id") or "")
+    turn_id = str(state.get("current_turn_id") or "")
+    start_reply(session_id, turn_id)
+
+    def on_delta(delta: str) -> None:
+        append_reply(session_id, delta)
+
+    final_reply, meta = await _stream_text_model(
+        SYNTHESIZER_PROMPT,
+        user_prompt,
+        on_delta=on_delta,
+    )
+    if session_id:
+        finish_reply(session_id)
     return {
         "final_reply": final_reply,
         "metrics_summary": _merge_metrics(
@@ -1399,6 +1537,7 @@ def _current_turn_record(state: dict[str, Any]) -> dict[str, Any] | None:
         "workflow_trace": _trace_for_turn(state.get("workflow_trace") or [], str(turn_id)),
         "artifacts": state.get("artifacts") or {},
         "metrics_summary": state.get("metrics_summary") or _default_metrics_summary(),
+        "thinking_log": list(state.get("turn_thinking_log") or []),
     }
 
 
@@ -1495,6 +1634,7 @@ async def run_agent_graph(
     else:
         existing_state = await _archive_current_turn(graph, config, existing_state)
         new_turn_id = str(uuid4())
+        reset_session_streams(session_id)
         input_state = {
             "messages": [{"role": "user", "content": user_input}],
             "session_id": session_id,
@@ -1528,6 +1668,7 @@ async def run_agent_graph(
             "approval_response": "",
             "pending_approval_group": "",
             "final_reply": "",
+            "turn_thinking_log": [],
         }
 
     final_state = await _invoke_with_timeout(graph, input_state, config)

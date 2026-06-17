@@ -40,6 +40,7 @@ class ReviewPayload(BaseModel):
 class TraceEvent(BaseModel):
     event_type: str
     node: str
+    turn_id: str | None = None
     detail: dict[str, Any] = Field(default_factory=dict)
 
 

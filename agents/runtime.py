@@ -5,6 +5,7 @@ import os
 import time
 from collections.abc import AsyncIterator
 from typing import Any
+from uuid import uuid4
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -275,12 +276,41 @@ def _artifact_context_text(state: AgentState) -> str:
     return json.dumps(artifacts, ensure_ascii=False)
 
 
-def _trace_event(node: str, event_type: str, **detail: Any) -> list[dict[str, Any]]:
-    return [TraceEvent(event_type=event_type, node=node, detail=detail).model_dump()]
+def _trace_event(
+    node: str,
+    event_type: str,
+    *,
+    turn_id: str | None = None,
+    **detail: Any,
+) -> list[dict[str, Any]]:
+    return [
+        TraceEvent(
+            event_type=event_type,
+            node=node,
+            turn_id=str(turn_id) if turn_id else None,
+            detail=detail,
+        ).model_dump()
+    ]
 
 
-def _step_trace_event(step: dict[str, Any], event_type: str, **detail: Any) -> list[dict[str, Any]]:
-    return _trace_event(
+def _trace_for_turn(trace: list[dict[str, Any]], turn_id: str | None) -> list[dict[str, Any]]:
+    if not turn_id:
+        return trace
+    return [event for event in trace if str(event.get("turn_id") or "") == str(turn_id)]
+
+
+def _state_trace_event(state: dict[str, Any], node: str, event_type: str, **detail: Any) -> list[dict[str, Any]]:
+    return _trace_event(node, event_type, turn_id=state.get("current_turn_id"), **detail)
+
+
+def _state_step_trace_event(
+    state: dict[str, Any],
+    step: dict[str, Any],
+    event_type: str,
+    **detail: Any,
+) -> list[dict[str, Any]]:
+    return _state_trace_event(
+        state,
         step.get("agent", "step"),
         event_type,
         step_id=step.get("id"),
@@ -616,7 +646,8 @@ async def _planner(state: AgentState) -> AgentState:
             usage=meta["usage"],
             model_calls=1,
         ),
-        "workflow_trace": _trace_event(
+        "workflow_trace": _state_trace_event(
+            state,
             "planner",
             "plan_created",
             step_count=len(plan["steps"]),
@@ -663,7 +694,7 @@ async def _approval_gate(state: AgentState) -> AgentState:
     if not requires_approval:
         return {
             "metrics_summary": state.get("metrics_summary", _default_metrics_summary()),
-            "workflow_trace": _trace_event("approval_gate", "approval_skipped", group_id=_get_current_group_id(state)),
+            "workflow_trace": _state_trace_event(state, "approval_gate", "approval_skipped", group_id=_get_current_group_id(state)),
             "workflow_status": "in_progress",
             "pending_approval_group": "",
             "approval_response": "",
@@ -679,7 +710,7 @@ async def _approval_gate(state: AgentState) -> AgentState:
                 state.get("metrics_summary"),
                 approval_rejected=1,
             ),
-            "workflow_trace": _trace_event("approval_gate", "approval_rejected", group_id=current_group),
+            "workflow_trace": _state_trace_event(state, "approval_gate", "approval_rejected", group_id=current_group),
             "workflow_status": "rejected",
             "pending_approval_group": current_group,
             "final_reply": message,
@@ -697,7 +728,7 @@ async def _approval_gate(state: AgentState) -> AgentState:
                 state.get("metrics_summary"),
                 approval_requested=1,
             ),
-            "workflow_trace": _trace_event("approval_gate", "approval_requested", group_id=current_group, goals=goals),
+            "workflow_trace": _state_trace_event(state, "approval_gate", "approval_requested", group_id=current_group, goals=goals),
             "workflow_status": "awaiting_approval",
             "pending_approval_group": current_group,
             "final_reply": message,
@@ -709,7 +740,7 @@ async def _approval_gate(state: AgentState) -> AgentState:
             state.get("metrics_summary"),
             approval_granted=1,
         ),
-        "workflow_trace": _trace_event("approval_gate", "approval_granted", group_id=current_group),
+        "workflow_trace": _state_trace_event(state, "approval_gate", "approval_granted", group_id=current_group),
         "workflow_status": "in_progress",
         "pending_approval_group": "",
         "approval_response": "",
@@ -721,7 +752,7 @@ async def _approval_gate(state: AgentState) -> AgentState:
 
 async def _run_research_step(step: dict[str, Any], state: AgentState) -> dict[str, Any]:
     trace_events: list[dict[str, Any]] = []
-    trace_events += _step_trace_event(step, "step_started", agent="research_agent")
+    trace_events += _state_step_trace_event(state, step, "step_started", agent="research_agent")
     if state.get("document_id"):
         started = time.perf_counter()
         result = await search_documents(query=step["goal"], document_id=state["document_id"])
@@ -758,7 +789,8 @@ async def _run_research_step(step: dict[str, Any], state: AgentState) -> dict[st
         artifact_data=parsed["artifact_data"],
         confidence=str(parsed["confidence"]),
     )
-    trace_events += _step_trace_event(
+    trace_events += _state_step_trace_event(
+        state,
         step,
         "step_completed",
         agent="research_agent",
@@ -796,7 +828,7 @@ async def _tool_execute(name: str, args: dict[str, Any], state: AgentState) -> s
 
 async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, Any]:
     trace_events: list[dict[str, Any]] = []
-    trace_events += _step_trace_event(step, "step_started", agent="tool_agent")
+    trace_events += _state_step_trace_event(state, step, "step_started", agent="tool_agent")
     local_messages: list[dict[str, Any]] = [
         {"role": "system", "content": f"{TOOL_AGENT_PROMPT}\n\n{STRUCTURED_STEP_OUTPUT_PROMPT}"},
         {
@@ -845,7 +877,8 @@ async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, A
             tool_call_count += 1
             fn_name = tool_call["function"]["name"]
             raw_args = tool_call["function"]["arguments"]
-            trace_events += _step_trace_event(
+            trace_events += _state_step_trace_event(
+                state,
                 step,
                 "tool_called",
                 agent="tool_agent",
@@ -859,7 +892,8 @@ async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, A
             else:
                 tool_result = await _tool_execute(fn_name, fn_args, state)
                 logger.info("tool_agent %s(%s) => %s", fn_name, fn_args, tool_result)
-            trace_events += _step_trace_event(
+            trace_events += _state_step_trace_event(
+                state,
                 step,
                 "tool_result",
                 agent="tool_agent",
@@ -881,7 +915,8 @@ async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, A
         artifact_data=final_parsed["artifact_data"],
         confidence=str(final_parsed["confidence"]),
     )
-    trace_events += _step_trace_event(
+    trace_events += _state_step_trace_event(
+        state,
         step,
         "step_completed",
         agent="tool_agent",
@@ -910,7 +945,7 @@ async def _run_tool_step(step: dict[str, Any], state: AgentState) -> dict[str, A
 
 async def _run_rag_step(step: dict[str, Any], state: AgentState) -> dict[str, Any]:
     trace_events: list[dict[str, Any]] = []
-    trace_events += _step_trace_event(step, "step_started", agent="rag_agent")
+    trace_events += _state_step_trace_event(state, step, "step_started", agent="rag_agent")
     started = time.perf_counter()
     result = await rag_chat(question=step["goal"], document_id=state.get("document_id"))
     duration_ms = int((time.perf_counter() - started) * 1000)
@@ -922,7 +957,8 @@ async def _run_rag_step(step: dict[str, Any], state: AgentState) -> dict[str, An
         artifact_data=result or "",
         confidence="medium",
     )
-    trace_events += _step_trace_event(
+    trace_events += _state_step_trace_event(
+        state,
         step,
         "step_completed",
         agent="rag_agent",
@@ -949,7 +985,7 @@ async def _run_rag_step(step: dict[str, Any], state: AgentState) -> dict[str, An
 
 async def _run_general_step(step: dict[str, Any], state: AgentState) -> dict[str, Any]:
     trace_events: list[dict[str, Any]] = []
-    trace_events += _step_trace_event(step, "step_started", agent="general_agent")
+    trace_events += _state_step_trace_event(state, step, "step_started", agent="general_agent")
     structured_payload, meta = await _call_structured_step_model(
         GENERAL_AGENT_PROMPT,
         (
@@ -971,7 +1007,8 @@ async def _run_general_step(step: dict[str, Any], state: AgentState) -> dict[str
         artifact_data=parsed["artifact_data"],
         confidence=str(parsed["confidence"]),
     )
-    trace_events += _step_trace_event(
+    trace_events += _state_step_trace_event(
+        state,
         step,
         "step_completed",
         agent="general_agent",
@@ -1011,7 +1048,8 @@ async def _dispatch_step(step: dict[str, Any], state: AgentState) -> dict[str, A
 async def _execute_group(state: AgentState) -> AgentState:
     steps = _get_current_group_steps(state)
     results = await asyncio.gather(*[_dispatch_step(step, state) for step in steps])
-    group_trace_events = _trace_event(
+    group_trace_events = _state_trace_event(
+        state,
         "execute_group",
         "group_started",
         group_id=_get_current_group_id(state),
@@ -1053,7 +1091,8 @@ async def _execute_group(state: AgentState) -> AgentState:
         "current_step_goal": "; ".join(step["goal"] for step in steps),
         "tool_iterations": 0,
         "workflow_trace": group_trace_events
-        + _trace_event(
+        + _state_trace_event(
+            state,
             "execute_group",
             "group_executed",
             group_id=_get_current_group_id(state),
@@ -1134,7 +1173,8 @@ async def _reviewer(state: AgentState) -> AgentState:
         ),
         "step_results": step_results,
         "step_retry_count": retry_count + 1 if decision == "retry" else 0,
-        "workflow_trace": _trace_event(
+        "workflow_trace": _state_trace_event(
+            state,
             "reviewer",
             "review_completed",
             decision=decision,
@@ -1160,7 +1200,8 @@ async def _advance_group(state: AgentState) -> AgentState:
         "step_retry_count": 0,
         "approval_response": "",
         "pending_approval_group": "",
-        "workflow_trace": _trace_event(
+        "workflow_trace": _state_trace_event(
+            state,
             "advance_group",
             "group_advanced",
             next_group_index=state.get("current_group_index", 0) + 1,
@@ -1192,7 +1233,8 @@ async def _rollback_group(state: AgentState) -> AgentState:
         "step_retry_count": 0,
         "approval_response": "",
         "pending_approval_group": "",
-        "workflow_trace": _trace_event(
+        "workflow_trace": _state_trace_event(
+            state,
             "rollback_group",
             "workflow_rolled_back",
             rollback_target=rollback_target,
@@ -1220,7 +1262,8 @@ async def _synthesizer(state: AgentState) -> AgentState:
             model_calls=1,
         ),
         "workflow_status": "completed",
-        "workflow_trace": _trace_event(
+        "workflow_trace": _state_trace_event(
+            state,
             "synthesizer",
             "final_answer_created",
             duration_ms=meta["duration_ms"],
@@ -1355,6 +1398,59 @@ async def _get_agent_graph():
     return _agent_graph
 
 
+def _latest_assistant_message(state: dict[str, Any]) -> str:
+    for message in reversed(state.get("messages", [])):
+        if message.get("role") == "assistant":
+            return str(message.get("content", "") or "")
+    return ""
+
+
+def _current_turn_record(state: dict[str, Any]) -> dict[str, Any] | None:
+    turn_id = state.get("current_turn_id")
+    if not turn_id:
+        return None
+
+    return {
+        "turn_id": turn_id,
+        "user_message": state.get("current_turn_user_message", ""),
+        "started_at": state.get("current_turn_started_at"),
+        "status": state.get("workflow_status"),
+        "route_reason": state.get("route_reason"),
+        "review_decision": state.get("review_decision"),
+        "review_reason": state.get("review_reason"),
+        "pending_approval_group": state.get("pending_approval_group"),
+        "reply": state.get("final_reply") or _latest_assistant_message(state),
+        "workflow_plan": state.get("workflow_plan") or [],
+        "workflow_trace": _trace_for_turn(state.get("workflow_trace") or [], str(turn_id)),
+        "artifacts": state.get("artifacts") or {},
+        "metrics_summary": state.get("metrics_summary") or _default_metrics_summary(),
+    }
+
+
+def _turn_is_terminal(state: dict[str, Any]) -> bool:
+    return str(state.get("workflow_status", "")).strip() in {"completed", "rejected", "timed_out"}
+
+
+async def _archive_current_turn(
+    graph: Any,
+    config: dict[str, dict[str, str]],
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    turn = _current_turn_record(state)
+    if turn is None or not _turn_is_terminal(state):
+        return state
+
+    turn_history = list(state.get("turn_history") or [])
+    turn_id = str(turn["turn_id"])
+    if any(str(existing.get("turn_id")) == turn_id for existing in turn_history):
+        return state
+
+    turn_history.append(turn)
+    await graph.aupdate_state(config, {"turn_history": turn_history})
+    snapshot = await graph.aget_state(config)
+    return snapshot.values or {}
+
+
 def _is_waiting_for_approval(snapshot: dict[str, Any]) -> bool:
     return (
         snapshot.get("workflow_status") == "awaiting_approval"
@@ -1386,6 +1482,7 @@ async def _invoke_with_timeout(
                 "workflow_trace": _trace_event(
                     "entry",
                     "workflow_timed_out",
+                    turn_id=existing_state.get("current_turn_id"),
                     timeout_ms=WORKFLOW_TIMEOUT_MS,
                 ),
             },
@@ -1421,12 +1518,18 @@ async def run_agent_graph(
             "final_reply": "",
         }
     else:
+        existing_state = await _archive_current_turn(graph, config, existing_state)
+        new_turn_id = str(uuid4())
         input_state = {
             "messages": [{"role": "user", "content": user_input}],
             "session_id": session_id,
             "document_id": document_id,
+            "current_turn_id": new_turn_id,
+            "current_turn_user_message": user_input,
+            "current_turn_started_at": time.time(),
+            "turn_history": list(existing_state.get("turn_history") or []),
             "artifacts": {},
-            "workflow_trace": _trace_event("entry", "workflow_started"),
+            "workflow_trace": _trace_event("entry", "workflow_started", turn_id=new_turn_id),
             "workflow_status": "planning",
             "workflow_plan": [],
             "success_criteria": [],
@@ -1457,12 +1560,23 @@ async def resume_agent_graph(
     user_input: str | None = None,
 ) -> str:
     graph = await _get_agent_graph()
+    snapshot = await graph.aget_state(_graph_config(session_id))
+    existing_state = snapshot.values or {}
     final_state = await _invoke_with_timeout(
         graph,
         {
             "messages": [{"role": "user", "content": user_input}] if user_input else [],
             "session_id": session_id,
-            "workflow_trace": _trace_event("entry", "workflow_resumed", approval_response=approval_response),
+            "current_turn_id": existing_state.get("current_turn_id"),
+            "current_turn_user_message": existing_state.get("current_turn_user_message", ""),
+            "current_turn_started_at": existing_state.get("current_turn_started_at"),
+            "turn_history": list(existing_state.get("turn_history") or []),
+            "workflow_trace": _trace_event(
+                "entry",
+                "workflow_resumed",
+                turn_id=existing_state.get("current_turn_id"),
+                approval_response=approval_response,
+            ),
             "workflow_status": "resume",
             "approval_response": approval_response,
             "final_reply": "",

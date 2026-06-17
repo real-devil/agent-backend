@@ -7,6 +7,10 @@ class AgentState(TypedDict, total=False):
     workflow_trace: Annotated[list[dict[str, Any]], add]
     session_id: str | None
     document_id: str | None
+    current_turn_id: str | None
+    current_turn_user_message: str
+    current_turn_started_at: float | None
+    turn_history: list[dict[str, Any]]
     route_reason: str
     final_reply: str
     artifacts: dict[str, Any]

@@ -320,6 +320,7 @@ async def run_agent_graph(
             "pending_approval_group": "",
             "final_reply": "",
             "turn_thinking_log": [],
+            "bypass_input_gates": False,
         }
 
     final_state = await _invoke_with_timeout(graph, input_state, config)
@@ -351,6 +352,7 @@ async def resume_agent_graph(
             ),
             "workflow_status": "resume",
             "approval_response": approval_response,
+            "bypass_input_gates": user_input is None,
             "final_reply": "",
         },
         _graph_config(session_id),

@@ -118,6 +118,18 @@ def resolve_trace_labels(
             return f"Approval rejected · group {detail.get('group_id', '?')}", "approval"
         case "approval_skipped":
             return "Approval not required", "approval"
+        case "gate_passed":
+            return f"Safety check passed · {node}", "system"
+        case "gate_rejected":
+            reason = detail.get("reason", "")
+            suffix = f" ({reason})" if reason else ""
+            return f"Input blocked{suffix}", "system"
+        case "rate_limited":
+            return "Rate limited · too many requests", "system"
+        case "circuit_open":
+            return "Circuit breaker open · service degraded", "system"
+        case "audit_recorded":
+            return "Audit log recorded", "system"
         case "review_completed":
             return f"Review · {detail.get('decision', 'continue')}", "review"
         case "workflow_rolled_back":
@@ -139,6 +151,8 @@ def _default_kind(event_type: str) -> ActivityKind:
         return "plan"
     if event_type.startswith("approval_"):
         return "approval"
+    if event_type in {"gate_passed", "gate_rejected", "rate_limited", "circuit_open", "audit_recorded"}:
+        return "system"
     if event_type in {"group_started", "group_executed"}:
         return "parallel"
     if event_type.startswith("step_"):

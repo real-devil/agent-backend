@@ -33,3 +33,4 @@ class AgentState(TypedDict, total=False):
     approval_response: str
     pending_approval_group: str
     turn_thinking_log: list[dict[str, Any]]
+    bypass_input_gates: bool

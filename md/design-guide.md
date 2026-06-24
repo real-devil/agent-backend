@@ -428,3 +428,126 @@ LangGraph = 给你积木 + 拼积木的工具
 > "为什么你们是 8 个节点，而不是更少或更多？"
 >
 > → 因为我们面向的是需要审计和审批的企业工作流。Planner 做规划、Approval 做人审、Reviewer 做质控、Synthesizer 做汇总。如果场景是简单客服，3 个节点就够。节点类型不是固定的，取决于业务需要。
+
+---
+
+## 九、双图架构：编排图 + 安全图
+
+### 核心思想
+
+编排图管"怎么跑对"，安全图管"怎么跑不死"。两套图并列，跑在同一个 LangGraph 里。
+
+```
+                    用户输入
+                       │
+              ┌────────┴────────┐
+              │                 │
+         安全护栏             业务编排
+              │                 │
+    input_gate                 │
+    rate_limiter               │
+              │                 │
+              └────────┬────────┘
+                       │
+                    Planner
+                       │
+                 approval_gate
+                       │
+              ┌────────┴────────┐
+              │                 │
+         tool_guard        execute_group
+    （每次 step 前校验）   reviewer
+              │            advance/rollback
+              └────────┬────────┘
+                       │
+                   synthesizer
+                       │
+              ┌────────┴────────┐
+              │                 │
+          output_gate      （最终回复）
+          circuit_breaker
+          audit_log
+              │
+           返回用户
+```
+
+### 安全图需要哪些节点
+
+```
+input_gate       → 长度限制、敏感词过滤、PII 脱敏、越狱检测
+rate_limiter     → 按用户/token 预算限流
+tool_guard       → 每个 step 执行前校验：这个 step 允许调这个 tool 吗？
+output_gate      → Synthesizer 之后过安全模型 + PII 检测 + 幻觉检测
+circuit_breaker  → 连续失败 N 次 → 短路降级为"请稍后再试"
+audit_log        → 每次 LLM call + tool 执行全记录
+```
+
+**它们就是普通的 node，跟 planner/reviewer 无区别。** 扩展方式完全一样：
+
+```
+1. 新建文件 nodes/input_gate.py
+2. 在 graph.py 里 add_node("input_gate", input_gate)
+3. 改边：entry → input_gate → planner
+```
+
+### 全部节点总览
+
+```
+当前项目的 8 个编排节点 + 企业级需要的 6 个安全节点 = 14 个
+
+编排层：
+  entry / planner / approval_gate / execute_group / reviewer
+  / advance_group / rollback_group / synthesizer
+
+安全层：
+  input_gate / rate_limiter / tool_guard / output_gate
+  / circuit_breaker / audit_log
+
+未来可能扩展：
+  replanner / classifier / translator / human_in_loop / A/B router
+```
+
+**所有扩展都是同一个模式：新 node 文件 → graph.py 里 add_node → add_edge。这是 LangGraph 的标准扩展范式。**
+
+### ReAct 模式（Cursor）也走安全图吗？
+
+**外部输入走，内部循环不走。**
+
+```
+用户输入 → input_gate（过一次）→ ReAct 循环开始
+                                    ↓
+  LLM 说 "get_weather"  ←── 不过 input_gate（这是内部 tool 结果，不是新用户输入）
+  执行 get_weather
+  拿到 "25°C"
+  喂回 LLM  ←── 不过 input_gate
+  LLM 说 "search_documents"
+  ...
+  直到 LLM 输出最终回复
+                                    ↓
+                              output_gate（过一次）→ 返回用户
+```
+
+**input_gate 只管"外部输入"，不管"内部流转"。** 因为内部流转的数据是系统自己产生的 tool 结果，不需要重新校验。如果每轮都过，反而增加延迟和误拦截。
+
+极端安全场景（金融、医疗）会在 output_gate 之后再加一层 `human_review`——最终回复必须人工点确认才能发给用户。
+
+---
+
+## 十、Agent 工程师的核心能力总结
+
+```
+                    ┌──────────────────┐
+                    │   编排图（核心）   │  ← 决定"怎么跑对"
+                    │   安全图（核心）   │  ← 决定"怎么跑不死"
+                    │   双图并列        │
+                    └────────┬─────────┘
+                             │
+            ┌────────────────┼────────────────┐
+            │                │                │
+       Prompt 工程       Tool 设计        评估与迭代
+       （指令怎么下）    （工具怎么写）    （怎么知道好坏）
+                             │
+                    基础设施（状态/流式/持久化）
+```
+
+**编排图 + 安全图搞定，其他都是增光添彩。** 这就是你说的那句话——这两个才是核心，剩下的技术细节可以现学现用。

@@ -178,3 +178,177 @@ TOOLS = [
 ```
 
 LLM 先 `read_file` 定位要改的代码 → 输出 `edit_file(old_string, new_string)` → 系统执行替换。
+
+---
+
+## 五、三种 Agent 模式的本质
+
+### 表面是三种，本质是两个维度
+
+| 模式 | 代表产品 | 有无 Graph？ | 下一步怎么定？ |
+|------|---------|------------|--------------|
+| A（Plan-then-Execute） | LangGraph、CrewAI | ✅ 启动前画完整 DAG | Planner 一次性决定全流程 |
+| B（单流 ReAct） | ChatGPT、Claude.ai | ❌ 无 | LLM 边想边决定何时调工具 |
+| C（动态多 Agent） | Cursor、Devin | ❌ 无 | 每步执行完，LLM 看结果再决定下一步 |
+
+### 本质分类
+
+```
+          有无 Graph
+          │
+    ┌─────┴─────┐
+    │           │
+  有 Graph    无 Graph
+  （A 模式）   │
+         ┌────┴────┐
+         │         │
+      单 Agent   多 Agent
+      （B 模式） （C 模式）
+      一气呵成   改一步看一步
+```
+
+**三种模式的差异只取决于两个决策：**
+
+1. **要不要提前画好执行图？** 要 → A；不要 → B 或 C
+2. **Agent 数量？** 1 个 → B；多个 → C
+
+### A vs C 的核心区别
+
+A 和 C 都是多 Agent，但：
+
+| | A（你的项目） | C（Cursor） |
+|---|---|---|
+| **后续步骤** | 提前确定，写死在 plan 里 | 不知道，靠上一步结果动态决定 |
+| **适用场景** | 流程固定、步骤可枚举（RAG→审核→导出） | 步骤依赖上一步结果（改代码→发现新 bug→再改） |
+| **优势** | 可审计、可审批、可提前优化并行 | 灵活，能应对未知情况 |
+| **劣势** | 计划可能跟不上实际情况 | 不可预测，难以审计 |
+
+**一句话**：A 是画好地图再走，C 是走一步看一步。
+
+### 选型指南
+
+| 场景 | 选哪个 | 原因 |
+|------|--------|------|
+| 流程固定、步骤可枚举 | A | RAG + 审核 + 导出报告，步骤事先就知道 |
+| 步骤依赖上一步结果 | C | 改代码、修 bug，改完才知道有没有新问题 |
+| 简单问答 | B | 不需要拆任务，单 LLM 直接回答 |
+| 企业内部 Agent 平台 | A 为主 | 需要审计、审批、可观测 |
+| 代码/IDE Agent | C 为主 | 需要灵活应对未知的代码问题 |
+
+### 面试时怎么说
+
+面试官不会问"ABC 三种模式的定义"，会问实际决策：
+
+> "为什么你们选了预规划而不是动态执行？"
+>
+> → 因为我们的场景是 RAG + 审核工作流，步骤可枚举，需要人工审批节点。预规划可以提前展示计划给用户确认，也能优化并行执行。
+>
+> "什么时候该用动态规划？"
+>
+> → 当步骤依赖上一步结果才能决定时，比如代码修复——改完一处可能发现新问题，无法事先规划全流程。
+
+---
+
+## 六、A 与 C 是同一种能力，只是调用节奏不同
+
+### 核心洞察
+
+A 的 plan 和 C 的每一步决策，**本质上都是 LLM 在做规划**。区别只在一个维度：
+
+```
+A: LLM 一次性输出 [step_A, step_B, step_C] → 系统按图执行
+C: LLM 输出 step_A → 执行 → 看结果 → 输出 step_B → 执行 → ...
+```
+
+| | LLM 什么时候输出后续步骤 |
+|---|---|
+| A | 一开始就全部输出 |
+| C | 做完一步再输出下一步 |
+
+**A 模式并没有更"智能"，C 模式也没有更"动态"——只是把 N 次 LLM 调用合并成了一开始的一次 Planner 调用。**
+
+### 所以三种模式其实是一种
+
+```
+所有 Agent 系统 = LLM 做决策 + 工具执行
+
+  B: 1 次 LLM 调用，LLM 自己决定何时调工具、何时结束
+  A: N 次 LLM 调用，但 N 个 step 的规划在第一次就全部做完（Planner）
+  C: N 次 LLM 调用，每次只决定下一步（ReAct 循环）
+
+区别只是：后续 step 的规划是在第一次调用时预产出，还是分散到每次调用中临时产出。
+```
+
+### Cursor 的本地 vs 云端分工
+
+Cursor 安装包不大，因为本地不跑 LLM：
+
+```
+本地（IDE 扩展）              云端（Cursor 后端 / API）
+─────────────────────        ─────────────────────────
+执行 tool：                  决策：
+  grep → 返回匹配             看到结果 → 决定 read_file
+  read_file → 返回代码        看到代码 → 决定 edit_file
+  edit_file → 执行替换        输出 old_string + new_string
+```
+
+**本地只做执行，云端做所有决策。** 跟你项目里的 `tool_agent` 一样——LLM 远程调（`AsyncOpenAI()`），tool 本地跑。区别只是 Cursor 的 tool 更多、prompt 更精妙。
+
+### 工程启示
+
+不要纠结"选 A 还是选 C"。实际生产中可以**混用**：
+
+- 顶层用 A：Planner 拆大任务（"修复这个模块的 bug"→ 定位、分析、修复、测试）
+- 每个 step 内部用 C：`code_agent` 在"修复"这个 step 里自己 grep → read → edit
+
+这就是**分层 Agent**：上层预规划，下层动态执行。大方向可控，细节灵活应对。
+
+---
+
+## 七、ReAct 才是纯种循环，Planner 不是
+
+### ReAct 的本质
+
+```
+ReAct = Reasoning（推理） + Acting（执行工具）
+
+一个死循环：
+  LLM 思考 → 调工具 → 拿到结果 → 再思考 → 再调工具 → ...
+  直到 LLM 觉得够了，不再调工具，输出最终答案
+```
+
+```python
+# 纯 ReAct（B/C 模式）
+while True:
+    response = llm.call(messages, tools=TOOLS)
+    if not response.tool_calls:
+        return response.content          # LLM 觉得够了，停止
+    for tool in response.tool_calls:
+        result = execute(tool)
+        messages.append(result)
+    # 循环...直到 LLM 不再调工具
+```
+
+### 三种模式里谁才是 ReAct
+
+| 模式 | 是不是 ReAct？ | 原因 |
+|------|--------------|------|
+| **B（ChatGPT）** | ✅ 纯 ReAct | LLM 想一步 → 调工具 → 再想一步 |
+| **C（Cursor）** | ✅ 纯 ReAct | 每一步决定下一步，标准循环 |
+| **A 的 Planner** | ❌ 不是 | 一次调用输出完整计划，没有"观察→再决策" |
+| **A 的 tool_agent** | ✅ 是 ReAct | `for _ in range(MAX_TOOL_ITERATIONS)` 就是循环 |
+
+### A 模式其实是 ReAct 外面包了一层
+
+```
+A 模式 = Planner（非 ReAct，一次性规划）
+       + tool_agent（ReAct 循环，最多 5 轮）
+       + Reviewer（非 ReAct，一次判断）
+       + Synthesizer（非 ReAct，一次汇总）
+```
+
+**Planner 没有循环**——它不会"执行一步→看结果→修正计划"。如果计划错了，靠 Reviewer 的 retry/rollback 兜底，而不是 Planner 自己修正。这跟 ReAct 的"边做边调整"本质不同。
+
+### 你项目早期的单 Agent 就是纯 ReAct
+
+最早的 `api/agent.py` 就是一个 `for _ in range(5)` 循环——LLM 调工具、拿结果、再调、直到不再调或超限。那才是纯 ReAct。后来加了 LangGraph 的 Planner/Reviewer/Synthesizer，就变成了**有监督的多 Agent 系统**。

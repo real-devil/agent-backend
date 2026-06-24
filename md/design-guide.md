@@ -349,6 +349,82 @@ A 模式 = Planner（非 ReAct，一次性规划）
 
 **Planner 没有循环**——它不会"执行一步→看结果→修正计划"。如果计划错了，靠 Reviewer 的 retry/rollback 兜底，而不是 Planner 自己修正。这跟 ReAct 的"边做边调整"本质不同。
 
+### 两层 ReAct：有 vs 没有
+
+```
+跨 step（Planner → Reviewer → advance 级别）：❌ 不是 ReAct
+
+  Planner 一次性输出完整 plan → 节点按图执行
+  Reviewer 只能 continue/retry/finish，不能改 plan
+  这是有意设计的——A 模式的核心价值就是"计划固定、可审计"
+
+step 内部（tool_agent 级别）：✅ 是 ReAct
+
+  tool_agent 执行 step_A：
+    → local_messages 累积历史
+    → LLM 调 get_weather → 拿到"下雨"
+    → LLM 看到结果，决定再调 search("室内活动")
+    → 链式决策，标准 ReAct 循环
+```
+
+**你项目现在有 ReAct，在 step 内部生效。跨 step 不是 ReAct，也不需要是——那是 Planner 的设计选择，不是缺陷。**
+
 ### 你项目早期的单 Agent 就是纯 ReAct
 
 最早的 `api/agent.py` 就是一个 `for _ in range(5)` 循环——LLM 调工具、拿结果、再调、直到不再调或超限。那才是纯 ReAct。后来加了 LangGraph 的 Planner/Reviewer/Synthesizer，就变成了**有监督的多 Agent 系统**。
+
+---
+
+## 八、模式之外：节点是积木，按需拼装
+
+### Replan 节点完全可以存在
+
+只是当前项目没有，不代表不能有：
+
+```
+Planner → execute_group_0 → Reviewer
+                                ↓ 发现 plan 不够
+                             replanner → execute_group_1 → Reviewer → Synthesizer
+```
+
+`replanner` 跟 Planner 技术相同（LLM 生成 step list），只是输入多了"已执行 step 的结果 + 剩余目标"。**不改变框架，只加一个节点 + 一条边。**
+
+### ABC 只是常见菜谱，不是菜系
+
+LangGraph 给的是一套积木：
+
+```
+决策类：    Planner / Reviewer / Replanner / Classifier / Router
+执行类：    Executor / ToolAgent / HumanInLoop
+汇总类：    Synthesizer / Summarizer / Translator
+控制类：    ApprovalGate / Timeout / Retry / Rollback
+```
+
+你可以拼出任何图：
+
+```
+客服机器人：   Classifier → ToolAgent → Synthesizer        （3 节点）
+代码助手：     ToolAgent（ReAct 循环，单节点内完成）        （无显式图）
+企业工作流：   Planner → Approval → Executor → Reviewer → Synthesizer
+              + rollback + advance                          （8 节点）
+带重规划的：   上面 + Replanner                             （9 节点）
+```
+
+### 真正的框架
+
+> "node type 从来都不是固定的，而是看企业和用户需要的。这样写的话，那就不只是模式 ABC 了。DEFGH，这些都可能有啊。"
+
+```
+不是：你的系统属于 A/B/C 哪种模式
+而是：你的场景需要哪些节点、怎么连线
+
+LangGraph = 给你积木 + 拼积木的工具
+模式 ABC = 别人拼好的几套常见方案
+你的工作 = 根据业务需求自己拼
+```
+
+### 面试时的话术
+
+> "为什么你们是 8 个节点，而不是更少或更多？"
+>
+> → 因为我们面向的是需要审计和审批的企业工作流。Planner 做规划、Approval 做人审、Reviewer 做质控、Synthesizer 做汇总。如果场景是简单客服，3 个节点就够。节点类型不是固定的，取决于业务需要。

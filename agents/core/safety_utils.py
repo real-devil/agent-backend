@@ -3,7 +3,7 @@
 import os
 from typing import Any
 
-from agents.core.trace_utils import state_trace_event
+from agents.tracing.event_factory import state_trace_event
 from agents.state import AgentState
 
 

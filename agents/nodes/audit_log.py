@@ -5,7 +5,7 @@ import logging
 import time
 
 from agents.core.safety_utils import safety_gates_enabled
-from agents.core.trace_utils import state_trace_event
+from agents.tracing.event_factory import state_trace_event
 from agents.state import AgentState
 
 logger = logging.getLogger("audit")

@@ -11,7 +11,7 @@ from agents.core.llm import get_client, get_model_name
 from agents.core.message_utils import get_latest_user_input, serialize_assistant_message
 from agents.core.metrics_utils import usage_to_dict
 from agents.core.prompts import STRUCTURED_STEP_OUTPUT_PROMPT, TOOL_AGENT_PROMPT
-from agents.core.trace_utils import state_step_trace_event
+from agents.tracing.event_factory import state_step_trace_event
 from tools.search import SEARCH_TOOL
 from tools.weather import WEATHER_TOOL
 

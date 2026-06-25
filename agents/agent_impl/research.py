@@ -8,7 +8,7 @@ from agents.core.artifact_utils import artifact_context_text, build_artifact_rec
 from agents.core.llm import call_structured_step_model
 from agents.core.message_utils import get_latest_user_input
 from agents.core.prompts import RESEARCH_AGENT_PROMPT
-from agents.core.trace_utils import state_step_trace_event
+from agents.tracing.event_factory import state_step_trace_event
 
 
 async def run_research_step(step: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:

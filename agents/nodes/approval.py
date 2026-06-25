@@ -3,7 +3,7 @@
 from agents.core.constants import APPROVAL_APPROVED, APPROVAL_REJECTED
 from agents.core.metrics_utils import default_metrics_summary, merge_metrics
 from agents.core.plan_utils import get_current_group_id, get_current_group_steps
-from agents.core.trace_utils import state_trace_event
+from agents.tracing.event_factory import state_trace_event
 from agents.state import AgentState
 
 

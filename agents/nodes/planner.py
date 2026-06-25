@@ -4,9 +4,9 @@ from agents.core.artifact_utils import artifact_context_text
 from agents.core.message_utils import get_latest_user_input, recent_conversation_text
 from agents.core.metrics_utils import merge_metrics
 from agents.core.plan_parser import call_planner_model, extract_planner_thinking, normalize_plan, parse_planner_response
-from agents.core.trace_utils import state_trace_event
+from agents.tracing.event_factory import state_trace_event
 from agents.state import AgentState
-from agents.trace_labels import format_step_label
+from agents.tracing.labels import format_step_label
 
 
 async def planner(state: AgentState) -> AgentState:

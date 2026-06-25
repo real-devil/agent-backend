@@ -11,8 +11,8 @@ from agents.core.prompts import PLANNER_PROMPT
 from agents.routing import fallback_plan_for_intents, reconcile_plan_steps
 from agents.schemas import StepSpec
 from agents.state import AgentState
-from agents.stream_buffer import append_thinking, finish_thinking, start_thinking
-from agents.trace_labels import format_step_label
+from agents.tracing.stream_buffer import append_thinking, finish_thinking, start_thinking
+from agents.tracing.labels import format_step_label
 
 
 def extract_planner_thinking(raw_content: str) -> str:

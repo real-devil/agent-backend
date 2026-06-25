@@ -9,7 +9,7 @@ from agents.core.metrics_utils import merge_metrics
 from agents.core.plan_utils import group_index_by_step_id, has_remaining_groups
 from agents.core.message_utils import parse_json_object
 from agents.core.prompts import REVIEWER_PROMPT
-from agents.core.trace_utils import state_trace_event
+from agents.tracing.event_factory import state_trace_event
 from agents.schemas import ReviewPayload
 from agents.state import AgentState
 

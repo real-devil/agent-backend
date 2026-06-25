@@ -4,7 +4,7 @@ import time
 from typing import Any
 
 from agents.core.artifact_utils import build_artifact_record
-from agents.core.trace_utils import state_step_trace_event
+from agents.tracing.event_factory import state_step_trace_event
 from services.rag import rag_chat
 
 

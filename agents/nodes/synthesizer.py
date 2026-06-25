@@ -7,9 +7,9 @@ from agents.core.llm import stream_text_model
 from agents.core.message_utils import get_latest_user_input
 from agents.core.metrics_utils import merge_metrics
 from agents.core.prompts import SYNTHESIZER_PROMPT
-from agents.core.trace_utils import state_trace_event
+from agents.tracing.event_factory import state_trace_event
 from agents.state import AgentState
-from agents.stream_buffer import append_reply, finish_reply, start_reply
+from agents.tracing.stream_buffer import append_reply, finish_reply, start_reply
 
 
 async def synthesizer(state: AgentState) -> AgentState:

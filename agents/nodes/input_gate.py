@@ -4,7 +4,7 @@ import logging
 
 from agents.core.message_utils import get_latest_user_input
 from agents.core.safety_utils import gate_passed_trace, safety_gates_enabled, should_bypass_input_gates
-from agents.core.trace_utils import state_trace_event
+from agents.tracing.event_factory import state_trace_event
 from agents.state import AgentState
 
 logger = logging.getLogger(__name__)

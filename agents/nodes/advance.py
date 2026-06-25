@@ -3,7 +3,7 @@
 from agents.core.artifact_utils import rebuild_artifacts_from_step_results
 from agents.core.metrics_utils import merge_metrics
 from agents.core.plan_utils import group_index_by_step_id, truncate_step_results_before_group
-from agents.core.trace_utils import state_trace_event
+from agents.tracing.event_factory import state_trace_event
 from agents.state import AgentState
 
 

@@ -9,9 +9,9 @@ from agents.agent_impl.research import run_research_step
 from agents.agent_impl.tool_agent import run_tool_step
 from agents.core.metrics_utils import merge_metrics
 from agents.core.plan_utils import get_current_group_id, get_current_group_steps
-from agents.core.trace_utils import state_trace_event
+from agents.tracing.event_factory import state_trace_event
 from agents.state import AgentState
-from agents.trace_labels import format_step_label
+from agents.tracing.labels import format_step_label
 
 
 async def dispatch_step(step: dict[str, Any], state: AgentState) -> dict[str, Any]:

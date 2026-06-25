@@ -16,9 +16,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from agents.core.constants import WORKFLOW_TIMEOUT_MS
 from agents.core.metrics_utils import default_metrics_summary
-from agents.core.trace_utils import trace_event, trace_for_turn
+from agents.tracing.event_factory import trace_event, trace_for_turn
 from agents.graph import build_agent_graph
-from agents.stream_buffer import reset_session_streams
+from agents.tracing.stream_buffer import reset_session_streams
 
 logger = logging.getLogger(__name__)
 

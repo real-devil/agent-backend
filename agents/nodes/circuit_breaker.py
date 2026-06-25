@@ -4,7 +4,7 @@ import logging
 from threading import Lock
 
 from agents.core.safety_utils import gate_passed_trace, is_circuit_failure, safety_gates_enabled
-from agents.core.trace_utils import state_trace_event
+from agents.tracing.event_factory import state_trace_event
 from agents.state import AgentState
 
 logger = logging.getLogger(__name__)

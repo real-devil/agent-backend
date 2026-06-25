@@ -147,12 +147,24 @@ async def stream_agent_session(
     session_id: str | None = None,
     document_id: str | None = None,
 ) -> AsyncIterator[str]:
+    """SSE 流式执行 — 后台跑图 + 轮询推事件。
+
+    数据流（所有 yield 都是实时推给前端的 SSE 消息）：
+      ① 先推 session_id
+      ② 图跑的过程中：推 trace 事件 → 推 thinking/reply 流式增量 → 推 state 快照
+      ③ 图跑完：推剩余的 trace → 推剩余的流式数据 → 推最终 state → 推 final
+    """
     active_session_id = session_id or str(uuid4())
+
+    # 如果前端传了已有的 session_id，算出已有多少条旧 trace，只推新增的
     pre_trace_count = 0
     if session_id:
         pre_snapshot = await get_workflow_snapshot(active_session_id)
         pre_trace_count = len(pre_snapshot.get("workflow_trace") or [])
 
+    # ========== 阶段 1：启动后台任务 ==========
+    # 把 run_agent_graph 丢到事件循环后台，立刻返回，不阻塞
+    # 图在后台跑，写入 checkpointer；我们前面轮询 checkpointer 观看
     task = asyncio.create_task(
         run_agent_graph(
             user_input=user_input,
@@ -161,23 +173,31 @@ async def stream_agent_session(
         )
     )
 
+    # 第一步：告诉前端 session_id
     yield _format_sse_event("session", {"session_id": active_session_id})
 
-    emitted_trace_count = pre_trace_count
-    last_signature = ""
-    stream_cursor = StreamEmitCursor()
+    emitted_trace_count = pre_trace_count  # 从这里开始，之前的旧事件不推
+    last_signature = ""                     # 上次 state 快照的指纹，防重复推送
+    stream_cursor = StreamEmitCursor()      # 记录 thinking/reply 已推到第几个字
+
     try:
+        # ========== 阶段 2：轮询 - 图没跑完就一直推 ==========
         while not task.done():
+            # 去 checkpointer 看最新的执行状态
             snapshot = await get_workflow_snapshot(active_session_id)
+
+            # --- 推 trace 事件：step_started / tool_called / review_completed ... ---
             trace = snapshot.get("workflow_trace") or []
             while emitted_trace_count < len(trace):
                 yield _format_trace_sse(active_session_id, trace[emitted_trace_count])
                 emitted_trace_count += 1
 
+            # --- 推 thinking / reply 流式增量（LLM 吐字的实时内容） ---
             stream_payloads, stream_cursor = await _yield_stream_events(active_session_id, stream_cursor)
             for payload in stream_payloads:
                 yield payload
 
+            # --- 如果整体状态变了，推一次完整快照（前端卡片展示用） ---
             current_signature = _snapshot_signature(snapshot)
             if current_signature != last_signature:
                 yield _format_sse_event(
@@ -186,10 +206,15 @@ async def stream_agent_session(
                 )
                 last_signature = current_signature
 
+            # 活跃时 60ms 推一次（有流式内容），空闲时 400ms（LLM 还在调）
             await asyncio.sleep(0.06 if (stream_payloads or _streams_need_fast_poll(active_session_id)) else 0.4)
 
-        reply = await task
+        # ========== 阶段 3：图跑完，收尾 ==========
+        reply = await task  # 拿 run_agent_graph 的返回值（final_reply）
+
+        # 再查一次，把最后可能漏掉的 trace / streaming / state 全部推出去
         snapshot = await get_workflow_snapshot(active_session_id)
+
         trace = snapshot.get("workflow_trace") or []
         while emitted_trace_count < len(trace):
             yield _format_trace_sse(active_session_id, trace[emitted_trace_count])
@@ -203,6 +228,7 @@ async def stream_agent_session(
             "state",
             _snapshot_to_session_state(active_session_id, snapshot),
         )
+        # 最后一条：event: final，前端收到后关闭 EventSource
         yield _format_sse_event(
             "final",
             {
@@ -212,6 +238,7 @@ async def stream_agent_session(
             },
         )
     except Exception as exc:
+        # 出了异常 → 取消后台任务 → 推 event: error → 前端展示错误提示
         if not task.done():
             task.cancel()
         yield _format_sse_event(

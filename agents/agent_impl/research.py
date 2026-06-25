@@ -4,7 +4,7 @@ import json
 import time
 from typing import Any
 
-from agents.core.artifact_utils import build_artifact_record, parse_structured_step_output
+from agents.core.artifact_utils import artifact_context_text, build_artifact_record, parse_structured_step_output
 from agents.core.llm import call_structured_step_model
 from agents.core.message_utils import get_latest_user_input
 from agents.core.prompts import RESEARCH_AGENT_PROMPT
@@ -28,8 +28,6 @@ async def run_research_step(step: dict[str, Any], state: dict[str, Any]) -> dict
             "confidence": "medium",
         }
     else:
-        from agents.core.artifact_utils import artifact_context_text
-
         structured_payload, meta = await call_structured_step_model(
             RESEARCH_AGENT_PROMPT,
             (

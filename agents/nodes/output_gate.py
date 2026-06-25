@@ -3,6 +3,7 @@
 import logging
 
 from agents.core.safety_utils import gate_passed_trace, safety_gates_enabled
+from agents.core.trace_utils import state_trace_event
 from agents.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -33,8 +34,6 @@ async def output_gate(state: AgentState) -> AgentState:
     """Validate the final reply before returning to the user."""
     if not safety_gates_enabled():
         return {}
-
-    from agents.core.trace_utils import state_trace_event
 
     final_reply = state.get("final_reply", "") or ""
     rejection = _check_output_safety(final_reply)

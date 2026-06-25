@@ -5,13 +5,8 @@ from typing import Any
 from uuid import uuid4
 
 from agents.runtime import get_workflow_snapshot, resume_agent_graph, run_agent_graph
-from agents.stream_buffer import StreamEmitCursor, collect_stream_events, get_session_streams
-
-
-def _trace_for_turn(trace: list[dict[str, Any]], turn_id: str | None) -> list[dict[str, Any]]:
-    if not turn_id:
-        return trace
-    return [event for event in trace if str(event.get("turn_id") or "") == str(turn_id)]
+from agents.tracing.stream_buffer import StreamEmitCursor, collect_stream_events, get_session_streams
+from agents.tracing.user_sink import trace_for_turn as _trace_for_turn
 
 
 def _current_turn_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any] | None:
@@ -76,24 +71,9 @@ def _snapshot_to_session_state(session_id: str, snapshot: dict[str, Any]) -> dic
     }
 
 
-def _format_sse_event(event: str, data: dict[str, Any]) -> str:
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-
-def _format_trace_sse(session_id: str, trace_event: dict[str, Any]) -> str:
-    return _format_sse_event(
-        "trace",
-        {
-            "session_id": session_id,
-            "turn_id": trace_event.get("turn_id"),
-            "trace": trace_event,
-        },
-    )
-
-
-def _format_stream_sse(session_id: str, event: dict[str, Any]) -> str:
-    event_type = str(event.pop("type", ""))
-    return _format_sse_event(event_type, {"session_id": session_id, **event})
+from agents.tracing.user_sink import format_sse_event as _format_sse_event
+from agents.tracing.user_sink import format_stream_sse as _format_stream_sse
+from agents.tracing.user_sink import format_trace_sse as _format_trace_sse
 
 
 def _streams_need_fast_poll(session_id: str) -> bool:

@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from agents.schemas import ArtifactRecord, StructuredStepOutput
+from agents.core.message_utils import parse_json_object
 from agents.state import AgentState
 
 
@@ -15,8 +16,6 @@ def artifact_context_text(state: AgentState) -> str:
 
 
 def parse_structured_step_output(raw_content: str, output_key: str) -> dict[str, Any]:
-    from agents.core.message_utils import parse_json_object
-
     payload = parse_json_object(raw_content)
     if not payload:
         return StructuredStepOutput(

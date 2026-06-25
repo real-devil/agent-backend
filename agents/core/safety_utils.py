@@ -3,6 +3,7 @@
 import os
 from typing import Any
 
+from agents.core.trace_utils import state_trace_event
 from agents.state import AgentState
 
 
@@ -27,6 +28,4 @@ def is_circuit_failure(state: AgentState) -> bool:
 
 
 def gate_passed_trace(state: dict[str, Any], node: str, **detail: Any) -> list[dict[str, Any]]:
-    from agents.core.trace_utils import state_trace_event
-
     return state_trace_event(state, node, "gate_passed", **detail)

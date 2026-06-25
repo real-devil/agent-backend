@@ -5,7 +5,7 @@ from typing import Any
 
 from agents.core.constants import PLAN_JSON_MARKER
 from agents.core.llm import stream_text_model
-from agents.core.message_utils import parse_json_object
+from agents.core.message_utils import get_latest_user_input, parse_json_object
 from agents.core.plan_utils import ordered_group_ids
 from agents.core.prompts import PLANNER_PROMPT
 from agents.routing import fallback_plan_for_intents, reconcile_plan_steps
@@ -90,8 +90,6 @@ async def call_planner_model(state: AgentState, user_prompt: str) -> tuple[str, 
 
 
 def fallback_plan(state: AgentState) -> dict[str, Any]:
-    from agents.core.message_utils import get_latest_user_input
-
     return fallback_plan_for_intents(
         get_latest_user_input(state),
         has_document=bool(state.get("document_id")),
@@ -99,8 +97,6 @@ def fallback_plan(state: AgentState) -> dict[str, Any]:
 
 
 def normalize_plan(payload: dict[str, Any], state: AgentState) -> dict[str, Any]:
-    from agents.core.message_utils import get_latest_user_input
-
     if not payload.get("steps"):
         payload = fallback_plan(state)
 

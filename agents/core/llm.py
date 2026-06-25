@@ -7,6 +7,8 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from agents.core.constants import DEFAULT_MODEL
+from agents.core.metrics_utils import usage_to_dict
+from agents.core.message_utils import parse_json_object
 from agents.core.prompts import STRUCTURED_STEP_OUTPUT_PROMPT
 
 
@@ -45,7 +47,6 @@ async def stream_text_model(
             if on_delta is not None:
                 on_delta(delta)
         if getattr(chunk, "usage", None) is not None:
-            from agents.core.metrics_utils import usage_to_dict
             usage = usage_to_dict(chunk.usage)
 
     duration_ms = int((time.perf_counter() - started) * 1000)
@@ -53,8 +54,6 @@ async def stream_text_model(
 
 
 async def call_text_model(system_prompt: str, user_prompt: str) -> tuple[str, dict[str, Any]]:
-    from agents.core.metrics_utils import usage_to_dict
-
     started = time.perf_counter()
     response = await get_client().chat.completions.create(
         model=get_model_name(),
@@ -72,8 +71,6 @@ async def call_text_model(system_prompt: str, user_prompt: str) -> tuple[str, di
 
 
 async def call_structured_step_model(system_prompt: str, user_prompt: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    from agents.core.message_utils import parse_json_object
-
     raw_content, meta = await call_text_model(
         f"{system_prompt}\n\n{STRUCTURED_STEP_OUTPUT_PROMPT}",
         user_prompt,

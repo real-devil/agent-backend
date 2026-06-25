@@ -4,6 +4,7 @@ import logging
 from threading import Lock
 
 from agents.core.safety_utils import gate_passed_trace, is_circuit_failure, safety_gates_enabled
+from agents.core.trace_utils import state_trace_event
 from agents.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -39,8 +40,6 @@ async def circuit_breaker(state: AgentState) -> AgentState:
     """
     if not safety_gates_enabled():
         return {}
-
-    from agents.core.trace_utils import state_trace_event
 
     session_id = str(state.get("session_id") or "")
     is_failure = is_circuit_failure(state)

@@ -2,7 +2,9 @@
 
 import logging
 
+from agents.core.message_utils import get_latest_user_input
 from agents.core.safety_utils import gate_passed_trace, safety_gates_enabled, should_bypass_input_gates
+from agents.core.trace_utils import state_trace_event
 from agents.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -38,9 +40,6 @@ async def input_gate(state: AgentState) -> AgentState:
     """
     if not safety_gates_enabled() or should_bypass_input_gates(state):
         return {}
-
-    from agents.core.message_utils import get_latest_user_input
-    from agents.core.trace_utils import state_trace_event
 
     user_input = get_latest_user_input(state)
 

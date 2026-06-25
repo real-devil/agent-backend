@@ -5,6 +5,7 @@ import logging
 import time
 
 from agents.core.safety_utils import safety_gates_enabled
+from agents.core.trace_utils import state_trace_event
 from agents.state import AgentState
 
 logger = logging.getLogger("audit")
@@ -21,8 +22,6 @@ async def audit_log(state: AgentState) -> AgentState:
     """Record a structured audit entry for this turn."""
     if not safety_gates_enabled():
         return {}
-
-    from agents.core.trace_utils import state_trace_event
 
     turn_id = state.get("current_turn_id", "?")
     session_id = state.get("session_id", "?")

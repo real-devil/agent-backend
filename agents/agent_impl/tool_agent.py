@@ -5,7 +5,7 @@ import logging
 import time
 from typing import Any
 
-from agents.core.artifact_utils import build_artifact_record, parse_structured_step_output
+from agents.core.artifact_utils import artifact_context_text, build_artifact_record, parse_structured_step_output
 from agents.core.constants import MAX_TOOL_ITERATIONS
 from agents.core.llm import get_client, get_model_name
 from agents.core.message_utils import get_latest_user_input, serialize_assistant_message
@@ -36,7 +36,6 @@ async def _tool_execute(name: str, args: dict[str, Any], state: dict[str, Any]) 
 async def run_tool_step(step: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     trace_events: list[dict[str, Any]] = []
     trace_events += state_step_trace_event(state, step, "step_started", agent="tool_agent")
-    from agents.core.artifact_utils import artifact_context_text
 
     local_messages: list[dict[str, Any]] = [
         {"role": "system", "content": f"{TOOL_AGENT_PROMPT}\n\n{STRUCTURED_STEP_OUTPUT_PROMPT}"},

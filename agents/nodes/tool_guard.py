@@ -2,6 +2,7 @@
 
 import logging
 
+from agents.core.plan_utils import get_current_group_steps
 from agents.core.safety_utils import gate_passed_trace, safety_gates_enabled
 from agents.state import AgentState
 
@@ -26,8 +27,6 @@ async def tool_guard(state: AgentState) -> AgentState:
     """Check current group steps against tool whitelist before execution."""
     if not safety_gates_enabled():
         return {}
-
-    from agents.core.plan_utils import get_current_group_steps
 
     steps = get_current_group_steps(state)
     for step in steps:

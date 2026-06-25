@@ -7,6 +7,7 @@ from agents.core.llm import call_text_model
 from agents.core.message_utils import get_latest_user_input
 from agents.core.metrics_utils import merge_metrics
 from agents.core.plan_utils import group_index_by_step_id, has_remaining_groups
+from agents.core.message_utils import parse_json_object
 from agents.core.prompts import REVIEWER_PROMPT
 from agents.core.trace_utils import state_trace_event
 from agents.schemas import ReviewPayload
@@ -27,7 +28,6 @@ async def reviewer(state: AgentState) -> AgentState:
         f"Has remaining groups after this one: {'yes' if has_remaining_groups(state) else 'no'}"
     )
     raw_content, meta = await call_text_model(REVIEWER_PROMPT, user_prompt)
-    from agents.core.message_utils import parse_json_object
 
     payload = parse_json_object(raw_content)
     try:

@@ -5,6 +5,7 @@ import time
 from threading import Lock
 
 from agents.core.safety_utils import gate_passed_trace, safety_gates_enabled, should_bypass_input_gates
+from agents.core.trace_utils import state_trace_event
 from agents.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -43,8 +44,6 @@ async def rate_limiter(state: AgentState) -> AgentState:
     """
     if not safety_gates_enabled() or should_bypass_input_gates(state):
         return {}
-
-    from agents.core.trace_utils import state_trace_event
 
     session_id = str(state.get("session_id") or "")
     if not session_id:

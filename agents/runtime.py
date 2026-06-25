@@ -272,6 +272,11 @@ async def run_agent_graph(
     graph = await _get_agent_graph()
     config = _graph_config(session_id)
     snapshot = await graph.aget_state(config)
+    '''
+    snapshot.values   → {"messages": [...], "workflow_status": "planning", ...}  ← 保存的AgentState副本
+    snapshot.next     → ("planner",)    ← 下次 resume 时从哪个节点开始
+    snapshot.config   → {"configurable": {"thread_id": "abc123"}}
+    '''
     existing_state = snapshot.values or {}
 
     if _is_waiting_for_approval(existing_state):

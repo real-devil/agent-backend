@@ -345,3 +345,57 @@ TypeB_SD / TypeC / TypeD / TypeE
 
 > 主要从 **Civitai** 下，开发选型用 **civitai.red** 或 **LiblibAI**；看 model card 和 trigger words，具体文件名记不清。
 
+---
+
+## 十、ComfyUI 生产部署：鉴权与工作流加载
+
+### 启动参数
+
+```bash
+python main.py \
+  --listen 0.0.0.0 --port 8188 \
+  --enable-auth \
+  --auth-username admin \
+  --auth-password 123456 \
+  --api-key abc123456
+```
+
+- 网页登录账号和 API 密钥**两套鉴权，互不通用**
+- 原生没有密钥管理面板，`--api-key` 自定义任意字符串
+- 生产环境用 UUID 或随机字符串生成几十位令牌
+
+### RunPod 部署方式
+
+```
+RunPod 容器 + ComfyUI → 暴露外网代理端口
+  ├── Pod：https://{podId}-8188.proxy.runpod.net
+  └── Serverless：https://api.runpod.ai/v2/{endpoint_id}/run
+
+鉴权：Header 内 Bearer Token 校验是否有权访问 SD 绘图服务
+```
+
+### 两种工作流加载方式
+
+| 方案 | 怎么传 | 适用场景 |
+|------|--------|---------|
+| 请求体传 JSON | 客户端把完整 workflow JSON 放在请求体里 | 动态工作流，前端自己拼 |
+| 本地 JSON 文件 | JSON 文件提前存在 GPU 服务器本地，调用时传文件名 | 固定工作流，生产环境用 |
+
+### 原生局限性
+
+- 原生**无法用 Token 区分工作流**——API Key 只管能不能调，不管调哪个工作流
+- 所以需要**前置网关做令牌和流程绑定**：不同 Token → 不同工作流，隔离测试与生产
+
+### 与 Dify 的区别
+
+| | RunPod + ComfyUI | Dify |
+|---|---|---|
+| 请求 URL | 固定（代理端口） | 全程固定不变 |
+| 鉴权 | Bearer Token（API Key） | Bearer Token（不同 Token 对应不同工作流） |
+| 工作流绑定 | **原生不支持**，需前置网关 | **内置**，Token 自动匹配后端工作流 |
+| 请求方式 | 传完整 workflow JSON 或文件名 | 传入业务参数，内部编排，直接返回结果 |
+
+### 面试口径
+
+> "RunPod 上 ComfyUI 的部署鉴权靠启动参数配网页密码和 API 密钥。原生 API Key 只能做准入控制，不能按 Token 分工作流——这块需要自己写前置网关做绑定。Dify 是内置的——请求 URL 不变，Header 里不同 Token 自动匹配后端工作流，不需要额外网关。"
+
